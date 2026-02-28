@@ -1,197 +1,251 @@
 # app.py
+from __future__ import annotations
+
+import json
+from datetime import datetime
+
 import streamlit as st
+
 from core.engine import DecisionEngine, EngineConfig
 
-st.set_page_config(page_title="Decision Mapping Lite", page_icon="🧭", layout="centered")
+APP_TITLE = "Decision Mapping Lite"
+APP_TAGLINE = "Turn anxiety into variables. Make reversible tests. Decide with evidence."
 
-# ✅ 暂时不要 cache_resource：避免 Streamlit Cloud 继续用旧的 engine/library
-def get_engine() -> DecisionEngine:
-    return DecisionEngine(EngineConfig())
 
-engine = get_engine()
+# ----------------------------
+# Helpers
+# ----------------------------
+def _ensure_options_state():
+    if "options" not in st.session_state:
+        # 仅是默认示例（不影响逻辑；你也可以删掉这些示例文本）
+        st.session_state.options = [
+            {
+                "name": "Option A",
+                "best": "If this goes well, I will gain momentum and clarity.",
+                "worst": "If this goes badly, I may lose time and confidence.",
+                "controls": "- Spend 6 hours/week on the core actions\n- Ship 1 small proof-of-work in 14 days\n- Do 2 short interviews with people who already did it",
+            },
+            {
+                "name": "Option B",
+                "best": "If this goes well, I will improve my platform and long-term upside.",
+                "worst": "If this goes badly, I may miss windows and feel stuck.",
+                "controls": "- Break into 14-day sprint\n- Track hours + output weekly\n- Keep 2 hours/week hedge for the other option",
+            },
+        ]
 
-# ✅ 版本号显示：用来确认你现在跑的是不是新 engine
-st.sidebar.caption(f"Engine: {getattr(engine, 'BUILD_ID', 'OLD_ENGINE')}")
-st.sidebar.caption("If you still see OLD_ENGINE, Streamlit is running old code.")
 
-st.title("🧭 Decision Mapping Lite (RAG-augmented)")
-st.caption("规则推导 + 语义检索增强：更少模板感、更贴你的决策语境。")
-
-with st.expander("使用说明（30秒）", expanded=True):
-    st.markdown(
-        """
-- 先从默认示例开始改：**删掉不适用的，补充你的事实**。
-- 输出不是标准答案，而是：**推导链 + 检索增强的重构/动作/护栏 + 下一步**。
-"""
+def _add_option():
+    st.session_state.options.append(
+        {"name": f"Option {len(st.session_state.options) + 1}", "best": "", "worst": "", "controls": ""}
     )
 
-st.divider()
 
-# ---------------------------
-# Default demo values (college senior)
-# ---------------------------
-demo_decision = "我是一名即将毕业的大四学生（2-3个月后毕业），正在纠结：未来 6 个月选择「直接就业 / 考研 / 考公」哪条路径更合适？"
-demo_options = (
-    "路径 A：直接就业（先找一份工作，边工作边探索方向）\n"
-    "路径 B：考研（目标：提升学历与专业能力，争取更好的平台）\n"
-    "路径 C：考公（目标：稳定与长期安全感，争取体制内发展）"
-)
-demo_status_6m = "我可能仍在纠结与投递/备考之间反复切换，行动不连续；压力变大但进展有限。"
-demo_status_2y = "如果一直拖延，可能错过秋招/春招窗口，备考也没有系统积累；自信受损，选择权变窄。"
+def _remove_option(i: int):
+    if 0 <= i < len(st.session_state.options):
+        st.session_state.options.pop(i)
 
-demo_a_name = "直接就业"
-demo_a_best = "拿到一份相对匹配的 offer（例如数据分析/运营/产品助理），开始积累工作经验与现金流，同时更清楚自己喜欢什么。"
-demo_a_worst = "找到的工作不匹配、压力大、成长慢；同时备考/转向成本上升，陷入“忙但不进步”。"
-demo_a_controls = (
-    "每周固定 6–8 小时做求职：简历迭代 + 投递 + 面试复盘\n"
-    "做 1 个可展示项目/作品（如数据分析报告/小产品PRD/作品集）\n"
-    "找 2 位在目标岗位的学长学姐做信息访谈，明确招聘门槛与常见坑\n"
-    "设置止损：如果 4 周无任何面试进展，立刻调整策略（岗位范围/简历/项目）"
-)
 
-demo_b_name = "考研"
-demo_b_best = "进入更好的学校/专业，获得更强的平台与资源，毕业后竞争力提升，方向更清晰。"
-demo_b_worst = "投入一年后落榜或结果一般；同时错过就业窗口，心理压力与家庭压力增大。"
-demo_b_controls = (
-    "把目标拆成 14 天冲刺：每两周一个小闭环（背诵/刷题/总结错题）\n"
-    "明确目标院校与分数线，做可行性评估（基础/时间/概率）\n"
-    "每周一次复盘：输出可量化指标（学习小时数/题量/正确率）\n"
-    "设置对冲：保留每周 2 小时的就业准备（简历/岗位信息/项目）"
-)
+def _fmt_options_list(options: list[dict]) -> str:
+    # 给 memo 里的“备选路径”一段可读的 bullet 文本
+    lines = []
+    for idx, o in enumerate(options, start=1):
+        nm = (o.get("name") or f"Option {idx}").strip()
+        lines.append(f"- 路径 {idx}：{nm}")
+    return "\n".join(lines)
 
-demo_priority = "长期选择权（Optionality）"
-demo_constraints = ["时间", "财务", "家庭", "情绪耐受度"]
-demo_regret = "没有尝试"
 
-demo_evidence_commit = (
-    "如果选择就业：2–4 周内至少获得 3 次面试机会（或 1 次高质量内推面试）\n"
-    "如果选择考研：连续 4 周每周>=25小时学习，且正确率/分数有明确上升\n"
-    "如果选择考公：完成一轮真题+错题整理，并在模拟中达到目标线附近"
-)
-demo_evidence_stop = (
-    "如果选择就业：连续 4 周投递>80 但0面试，说明策略有问题，需要重构方向/简历/项目\n"
-    "如果选择考研：连续 2 周明显无法投入（健康/焦虑/家庭冲突），先降波动再继续\n"
-    "如果选择考公：学习投入稳定但成绩长期无提升，需要重新评估岗位/方法/是否适配"
-)
-demo_partial_control = (
-    "时间块（部分可控）：每天固定 90 分钟“深度块”，不被手机/社交打断；周末 2 个 3 小时块做闭环输出。\n"
-    "情绪耐受（部分可控）：先把“终身决定”降级为“两周试探”，用证据驱动，而不是情绪驱动。"
-)
-demo_identity_anchor = "我想成为一个能在不确定中保持稳定推进的人：不靠情绪做重大决定，而靠结构化试探与证据来收敛路径。"
+def _to_payload_cn(options: list[dict]) -> dict:
+    """
+    将“任意条路径”映射到 engine.py 需要的字段。
+    说明：你现在的 engine.py 用的是 a/b 两条路径（最小版本）。
+    所以这里采用：用户填了 2+ 条时，取前两条做本轮推导。
+    但 app.py 不写死“只能两条”，UI 允许用户先脑暴 3-5 条，再挑前两条做一轮 memo。
+    """
+    # 至少保证有两条
+    while len(options) < 2:
+        options.append({"name": "Option", "best": "", "worst": "", "controls": ""})
 
-# ---------------------------
-# Inputs (prefilled)
-# ---------------------------
-decision = st.text_area(
-    "1) 你正在面对的关键决策是什么？",
-    value=demo_decision,
-    height=90,
-)
+    a = options[0]
+    b = options[1]
 
-options = st.text_area(
-    "2) 你的备选路径有哪些？（至少2个）",
-    value=demo_options,
-    height=130,
-)
+    constraints = []
+    for k in ["时间", "财务", "家庭", "情绪耐受度", "健康", "签证/地域", "资源/人脉"]:
+        if st.session_state.get(f"c_{k}", False):
+            constraints.append(k)
+    extra_constraints = (st.session_state.get("constraints_extra") or "").strip()
+    if extra_constraints:
+        # 允许用户用逗号/顿号分隔
+        for part in extra_constraints.replace("、", ",").split(","):
+            part = part.strip()
+            if part and part not in constraints:
+                constraints.append(part)
 
-status_6m = st.text_area(
-    "3) 如果你什么都不改变：6个月后最可能是什么状态？",
-    value=demo_status_6m,
-    height=90,
-)
+    payload = {
+        "decision": st.session_state.get("decision", "").strip(),
+        "options": _fmt_options_list(options),
+        "status_6m": st.session_state.get("status_6m", "").strip(),
+        "status_2y": st.session_state.get("status_2y", "").strip(),
+        # A/B（取前两条路径做本轮 memo）
+        "a_name": (a.get("name") or "Option A").strip(),
+        "a_best": (a.get("best") or "").strip(),
+        "a_worst": (a.get("worst") or "").strip(),
+        "a_controls": (a.get("controls") or "").strip(),
+        "b_name": (b.get("name") or "Option B").strip(),
+        "b_best": (b.get("best") or "").strip(),
+        "b_worst": (b.get("worst") or "").strip(),
+        "b_controls": (b.get("controls") or "").strip(),
+        # objective
+        "priority": st.session_state.get("priority", "长期选择权（Optionality）").strip(),
+        "constraints": constraints,
+        "regret": st.session_state.get("regret", "没有尝试").strip(),
+        # controllability + identity
+        "partial_control": st.session_state.get("partial_control", "").strip(),
+        "identity_anchor": st.session_state.get("identity_anchor", "").strip(),
+        # evidence signals (free-form, engine 会抽 1 条最相关的)
+        "evidence_to_commit": st.session_state.get("evidence_to_commit", "").strip(),
+        "evidence_to_stop": st.session_state.get("evidence_to_stop", "").strip(),
+    }
+    return payload
 
-status_2y = st.text_area(
-    "4) 如果你什么都不改变：2年后最可能是什么状态？",
-    value=demo_status_2y,
-    height=90,
-)
 
-st.subheader("路径拆解（A / B 必填）")
-col1, col2 = st.columns(2)
+# ----------------------------
+# UI
+# ----------------------------
+st.set_page_config(page_title=APP_TITLE, layout="wide")
+_ensure_options_state()
 
-with col1:
-    st.markdown("### 路径 A")
-    a_name = st.text_input("A 的名字（简短）", value=demo_a_name)
-    a_best = st.text_area("A：最好结果", value=demo_a_best, height=90)
-    a_worst = st.text_area("A：最坏结果", value=demo_a_worst, height=90)
-    a_controls = st.text_area("A：可控变量（你能做什么来降低风险）", value=demo_a_controls, height=120)
+st.title(APP_TITLE)
+st.caption(APP_TAGLINE)
 
-with col2:
-    st.markdown("### 路径 B")
-    b_name = st.text_input("B 的名字（简短）", value=demo_b_name)
-    b_best = st.text_area("B：最好结果", value=demo_b_best, height=90)
-    b_worst = st.text_area("B：最坏结果", value=demo_b_worst, height=90)
-    b_controls = st.text_area("B：可控变量（你能做什么来降低风险）", value=demo_b_controls, height=120)
+left, right = st.columns([1, 1])
 
-st.subheader("目标与约束")
-priority = st.radio(
-    "5) 现在对你最重要的是哪一个？",
-    ["稳定性", "收入", "成长", "自由度", "长期选择权（Optionality）"],
-    index=["稳定性", "收入", "成长", "自由度", "长期选择权（Optionality）"].index(demo_priority),
-)
-
-constraints = st.multiselect(
-    "6) 你现在的真实约束是？（多选）",
-    ["财务", "时间", "家庭", "技能差距", "情绪耐受度", "健康", "地理位置", "身份/自我叙事", "其他"],
-    default=demo_constraints,
-)
-
-regret = st.radio(
-    "7) 5年后的你回看今天：更可能后悔哪一种？",
-    ["没有尝试", "冒险失败"],
-    index=["没有尝试", "冒险失败"].index(demo_regret),
-)
-
-st.subheader("证据与试探（你的风格核心）")
-evidence_to_commit = st.text_area(
-    "8) 你需要看到什么证据，才会对某条路径“加码/承诺”？（证据门槛）",
-    value=demo_evidence_commit,
-    height=120,
-)
-evidence_to_stop = st.text_area(
-    "9) 你需要看到什么信号，才会“止损/换路径”？（止损条件）",
-    value=demo_evidence_stop,
-    height=120,
-)
-partial_control = st.text_area(
-    "10) 你现在最关键的「部分可控」变量是什么？你准备怎么把它往有利方向推一点？",
-    value=demo_partial_control,
-    height=120,
-)
-identity_anchor = st.text_area(
-    "11) 这个决策与你想成为的那种人有什么关系？（身份轨迹锚）",
-    value=demo_identity_anchor,
-    height=90,
-)
-
-st.divider()
-
-go = st.button("✅ 生成我的决策备忘录", type="primary", use_container_width=True)
-
-if go:
-    payload = dict(
-        decision=decision,
-        options=options,
-        status_6m=status_6m,
-        status_2y=status_2y,
-        a_name=a_name, a_best=a_best, a_worst=a_worst, a_controls=a_controls,
-        b_name=b_name, b_best=b_best, b_worst=b_worst, b_controls=b_controls,
-        priority=priority,
-        constraints=constraints,
-        regret=regret,
-        evidence_to_commit=evidence_to_commit,
-        evidence_to_stop=evidence_to_stop,
-        partial_control=partial_control,
-        identity_anchor=identity_anchor,
+with left:
+    st.subheader("1) Describe your decision")
+    st.text_area(
+        "Your decision (1–2 sentences)",
+        key="decision",
+        height=100,
+        placeholder="Example: In the next 6 months, should I switch roles, keep my current path, or build something new?",
     )
 
-    memo = engine.build_memo_cn(payload)
-    st.success("已生成（含语义检索增强）。")
-    st.code(memo, language="markdown")
-    st.download_button(
-        "⬇️ 下载为 Markdown（.md）",
-        data=memo.encode("utf-8"),
-        file_name="decision_memo.md",
-        mime="text/markdown",
-        use_container_width=True,
+    st.subheader("2) Baseline if you don't change")
+    st.text_area("6 months baseline", key="status_6m", height=80, placeholder="If I do nothing, in 6 months I will likely...")
+    st.text_area("2 years baseline", key="status_2y", height=80, placeholder="If I do nothing, in 2 years I will likely...")
+
+    st.subheader("3) Objective & constraints")
+    st.text_input("Your primary objective (goal function)", key="priority", value="长期选择权（Optionality）")
+
+    c1, c2, c3 = st.columns(3)
+    with c1:
+        st.checkbox("时间", key="c_时间", value=True)
+        st.checkbox("财务", key="c_财务", value=True)
+        st.checkbox("健康", key="c_健康", value=False)
+    with c2:
+        st.checkbox("家庭", key="c_家庭", value=True)
+        st.checkbox("情绪耐受度", key="c_情绪耐受度", value=True)
+        st.checkbox("签证/地域", key="c_签证/地域", value=False)
+    with c3:
+        st.checkbox("资源/人脉", key="c_资源/人脉", value=False)
+
+    st.text_input("Extra constraints (comma-separated)", key="constraints_extra", placeholder="e.g., internship contract, graduation thesis, caregiving")
+
+    st.text_input("Regret tendency (what you'll regret most)", key="regret", value="没有尝试")
+
+    st.subheader("4) Partially controllable levers")
+    st.text_area(
+        "What is partially controllable right now?",
+        key="partial_control",
+        height=90,
+        placeholder="Examples: daily 90-min deep work block; stable sleep; weekly review; reduce conflict/overload before deciding.",
     )
+
+    st.subheader("5) Evidence thresholds")
+    st.text_area(
+        "Evidence to commit (free-form lines)",
+        key="evidence_to_commit",
+        height=90,
+        placeholder="- If I choose Option A: within 2–4 weeks, get 3 interviews OR ship 1 demo\n- If I choose Option B: 4 weeks in a row, >=25h/week + measurable score improvement",
+    )
+    st.text_area(
+        "Stop / pivot signals (free-form lines)",
+        key="evidence_to_stop",
+        height=90,
+        placeholder="- If Option A: 80 applications and 0 interviews -> resume/portfolio strategy is broken\n- If Option B: 2 weeks can't study due to health/anxiety -> stabilize before pushing",
+    )
+
+    st.subheader("6) Identity anchor")
+    st.text_area(
+        "Who are you becoming through this decision?",
+        key="identity_anchor",
+        height=80,
+        placeholder="Example: I want to become someone who can move steadily under uncertainty, using evidence and reversible tests.",
+    )
+
+with right:
+    st.subheader("Options (you can add/remove; nothing is hardcoded)")
+    btns = st.columns([1, 1, 2])
+    with btns[0]:
+        st.button("➕ Add option", on_click=_add_option, use_container_width=True)
+    with btns[1]:
+        st.button("🔄 Reset", on_click=lambda: st.session_state.pop("options", None), use_container_width=True)
+
+    st.divider()
+
+    # render dynamic options
+    for i, opt in enumerate(st.session_state.options):
+        with st.container(border=True):
+            top = st.columns([6, 1])
+            with top[0]:
+                st.text_input(f"Option name", value=opt.get("name", ""), key=f"opt_{i}_name")
+            with top[1]:
+                st.button("🗑️", key=f"del_{i}", on_click=_remove_option, args=(i,))
+
+            st.text_area("Best case", value=opt.get("best", ""), key=f"opt_{i}_best", height=70)
+            st.text_area("Worst case", value=opt.get("worst", ""), key=f"opt_{i}_worst", height=70)
+            st.text_area("Controllable levers (bullets)", value=opt.get("controls", ""), key=f"opt_{i}_controls", height=90)
+
+    st.divider()
+
+    # sync UI -> state.options
+    synced = []
+    for i in range(len(st.session_state.options)):
+        synced.append(
+            {
+                "name": st.session_state.get(f"opt_{i}_name", st.session_state.options[i].get("name", "")),
+                "best": st.session_state.get(f"opt_{i}_best", st.session_state.options[i].get("best", "")),
+                "worst": st.session_state.get(f"opt_{i}_worst", st.session_state.options[i].get("worst", "")),
+                "controls": st.session_state.get(f"opt_{i}_controls", st.session_state.options[i].get("controls", "")),
+            }
+        )
+    st.session_state.options = synced
+
+    st.subheader("Generate")
+    colA, colB = st.columns([1, 1])
+    with colA:
+        generate = st.button("Generate Decision Memo (CN)", type="primary", use_container_width=True)
+    with colB:
+        st.download_button(
+            "Download inputs (JSON)",
+            data=json.dumps(_to_payload_cn(st.session_state.options), ensure_ascii=False, indent=2),
+            file_name=f"decision_inputs_{datetime.now().strftime('%Y%m%d_%H%M')}.json",
+            mime="application/json",
+            use_container_width=True,
+        )
+
+    if generate:
+        engine = DecisionEngine(EngineConfig())
+        payload = _to_payload_cn(st.session_state.options)
+        memo = engine.build_memo_cn(payload)
+
+        st.success("Generated.")
+        st.text_area("Decision Memo (CN)", value=memo, height=520)
+
+        st.download_button(
+            "Download memo (Markdown)",
+            data=memo.encode("utf-8"),
+            file_name=f"decision_memo_{datetime.now().strftime('%Y%m%d_%H%M')}.md",
+            mime="text/markdown",
+            use_container_width=True,
+        )
+
+st.caption("Privacy: runs on Streamlit Cloud. Do not paste sensitive personal data.")
