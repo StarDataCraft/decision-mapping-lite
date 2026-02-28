@@ -4,11 +4,15 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Dict, List, Any
 from datetime import datetime
+import re
 
 from core.library import PLAYBOOK
 from core.embedder import HybridEmbedder, EmbeddingConfig
 
 
+# ---------------------------
+# Small utilities
+# ---------------------------
 def _text_richness_score(text: str) -> int:
     """粗略判断描述是否具体（越具体越可推导）。0~3"""
     if not text or not text.strip():
@@ -44,6 +48,118 @@ def _bulletize(text: str) -> str:
     return "\n".join([f"- {ln}" for ln in lines])
 
 
+def _safe_str(x: Any) -> str:
+    return (x or "").strip() if isinstance(x, str) else (str(x) if x is not None else "")
+
+
+class _SafeDict(dict):
+    """format_map safe dict: missing keys -> empty string"""
+    def __missing__(self, key):
+        return ""
+
+
+def _safe_format(template: str, slots: Dict[str, Any]) -> str:
+    if not template:
+        return ""
+    try:
+        return template.format_map(_SafeDict({k: _safe_str(v) for k, v in slots.items()}))
+    except Exception:
+        # In case template contains unexpected braces etc.
+        return template
+
+
+def _split_lines(text: str) -> List[str]:
+    if not text:
+        return []
+    raw = text.replace("\r", "").split("\n")
+    out = []
+    for ln in raw:
+        ln = ln.strip().lstrip("•-").strip()
+        if ln:
+            out.append(ln)
+    return out
+
+
+def _concreteness_score(line: str) -> int:
+    """Prefer lines with numbers/time/explicit constraints; longer also helps."""
+    if not line:
+        return 0
+    s = 0
+    if re.search(r"\d", line):
+        s += 2
+    if any(k in line for k in ["小时", "h", "周", "每天", "两周", "14 天", "48 小时", "面试", "投递", "真题", "错题", "正确率", "分数", "模拟"]):
+        s += 2
+    if len(line) >= 18:
+        s += 1
+    if any(k in line for k in ["输出", "作品", "项目", "复盘", "内推", "访谈", "计划"]):
+        s += 1
+    return s
+
+
+def _pick_most_concrete_control(controls_text: str) -> str:
+    """Pick the single most concrete action line from controls."""
+    lines = _split_lines(controls_text)
+    if not lines:
+        return ""
+    scored = sorted(lines, key=lambda x: _concreteness_score(x), reverse=True)
+    return scored[0]
+
+
+def _extract_risk_keywords(text: str, top_n: int = 3) -> List[str]:
+    """
+    Simple keyword extraction without ML:
+    - Pull short Chinese phrases around separators
+    - Plus a small curated list of 'risk' terms
+    """
+    if not text:
+        return []
+    t = re.sub(r"[，。；、,.!?:：\n\r\t]+", " ", text).strip()
+
+    curated = ["压力", "成长", "不匹配", "错过", "窗口", "失败", "落榜", "焦虑", "家庭", "自信", "成本", "拖延", "内耗"]
+    hits = [w for w in curated if w in text]
+
+    # Extract candidate chunks (2~8 chars Chinese sequences)
+    chunks = re.findall(r"[\u4e00-\u9fff]{2,8}", t)
+    # Remove very common stop-like words
+    stop = {"可能", "同时", "但是", "因为", "如果", "这样", "这个", "那个", "自己", "很多", "然后"}
+    chunks = [c for c in chunks if c not in stop]
+
+    # Frequency-based (very light)
+    freq: Dict[str, int] = {}
+    for c in chunks:
+        freq[c] = freq.get(c, 0) + 1
+
+    # Start with curated hits (order-preserving)
+    out: List[str] = []
+    for h in hits:
+        if h not in out:
+            out.append(h)
+
+    # Add frequent chunks
+    sorted_chunks = sorted(freq.items(), key=lambda kv: kv[1], reverse=True)
+    for c, _ in sorted_chunks:
+        if c not in out:
+            out.append(c)
+        if len(out) >= top_n:
+            break
+
+    return out[:top_n]
+
+
+def _first_sentence(text: str) -> str:
+    if not text:
+        return ""
+    # Split by Chinese/English sentence punctuation
+    parts = re.split(r"[。.!?！？]+", text.strip())
+    for p in parts:
+        if p.strip():
+            return p.strip()
+    return text.strip()
+
+
+# ---------------------------
+# Engine
+# ---------------------------
 @dataclass
 class EngineConfig:
     # 纯开源、本地跑：CPU 友好（Streamlit Cloud 推荐）
@@ -56,23 +172,44 @@ class DecisionEngine:
     Hybrid engine:
     - Rule-based, explainable reasoning (stable + controllable)
     - Retrieval-augmented suggestions using open-source embeddings (no API key)
-      with safe fallback to TF-IDF (still no key) if the embedding model fails to load.
+    - Slot-filling playbook items + input-derived explanation paragraphs
     """
 
     def __init__(self, cfg: EngineConfig):
         self.cfg = cfg
         self.embedder = HybridEmbedder(EmbeddingConfig(model_name=cfg.embed_model))
 
-        # Prepare playbook texts for retrieval
+        # Prepare playbook texts for retrieval (include lang/type/title/text)
         self._pb_texts = [
-            f"{x['type']} | {x['title']}\n{x['text']}\nTags: {', '.join(x.get('tags', []))}"
+            f"{x.get('lang','')} | {x['type']} | {x['title']}\n{x['text']}\nTags: {', '.join(x.get('tags', []))}"
             for x in PLAYBOOK
         ]
 
-    def retrieve(self, query: str, k: int | None = None) -> List[Dict[str, Any]]:
-        k = k or self.cfg.retrieve_k
-        idxs = self.embedder.top_k(query, self._pb_texts, k=k)
-        return [PLAYBOOK[i] for i in idxs]
+    def _retrieve(self, query: str, k: int, lang: str) -> List[Dict[str, Any]]:
+        """Retrieve top-k from entire playbook, then filter by lang; backfill if needed."""
+        idxs = self.embedder.top_k(query, self._pb_texts, k=min(max(k * 2, 8), len(PLAYBOOK)))
+        candidates = [PLAYBOOK[i] for i in idxs]
+
+        # Filter by lang if possible
+        filtered = [x for x in candidates if x.get("lang") == lang]
+        if len(filtered) >= k:
+            return filtered[:k]
+
+        # Backfill with any language if not enough
+        for x in candidates:
+            if x not in filtered:
+                filtered.append(x)
+            if len(filtered) >= k:
+                break
+        return filtered[:k]
+
+    def _fill_items(self, items: List[Dict[str, Any]], slots: Dict[str, Any]) -> List[Dict[str, Any]]:
+        out: List[Dict[str, Any]] = []
+        for x in items:
+            y = dict(x)
+            y["text_filled"] = _safe_format(y.get("text", ""), slots)
+            out.append(y)
+        return out
 
     def build_memo_cn(self, payload: Dict[str, Any]) -> str:
         # ---- unpack ----
@@ -99,6 +236,8 @@ class DecisionEngine:
         evidence_to_stop = payload.get("evidence_to_stop") or ""
         partial_control = payload.get("partial_control") or ""
         identity_anchor = payload.get("identity_anchor") or ""
+
+        constraints_str = "、".join(constraints) if constraints else "（未填写）"
 
         # ---- rule features ----
         optionality_pref = priority == "长期选择权（Optionality）"
@@ -169,7 +308,30 @@ class DecisionEngine:
         else:
             trial_pick = a_name if a_manage > b_manage else b_name
 
-        # ---- retrieval augmentation (open-source, no key) ----
+        # ---- Input-derived personalization (NEW) ----
+        a_best_control = _pick_most_concrete_control(a_controls)
+        b_best_control = _pick_most_concrete_control(b_controls)
+
+        # Pick a "worst focus" phrase to inject into safeguards
+        worst_focus = _first_sentence(a_worst) if a_worst.strip() else _first_sentence(b_worst)
+        if not worst_focus:
+            worst_focus = "（未填写最坏结果）"
+
+        risk_terms = _extract_risk_keywords((a_worst or "") + " " + (b_worst or ""), top_n=3)
+        risk_terms_str = "、".join(risk_terms) if risk_terms else "（未提取到明显风险词）"
+
+        explanation_personal = f"""
+你这里最关键的信息其实不是“路径名字”，而是你写出的 **可控抓手** 与 **风险核心**。
+
+- 你在 {a_name} 里最具体的抓手是：{a_best_control if a_best_control else "（未写出具体行动）"}
+- 你在 {b_name} 里最具体的抓手是：{b_best_control if b_best_control else "（未写出具体行动）"}
+- 你反复担心的风险词集中在：{risk_terms_str}
+
+所以建议之所以成立，不是因为“某条路更正确”，而是因为：
+你已经把不确定性拆成了可行动作（抓手），也识别了风险核心（你在怕什么），下一步只需要用证据门槛把试探闭环起来。
+""".strip()
+
+        # ---- Retrieval augmentation with slot-filling (NEW) ----
         query = "\n".join(
             [
                 decision,
@@ -178,22 +340,49 @@ class DecisionEngine:
                 f"{a_name} worst: {a_worst}",
                 f"{b_name} worst: {b_worst}",
                 f"priority: {priority}",
-                f"constraints: {', '.join(constraints) if constraints else ''}",
+                f"constraints: {constraints_str}",
                 f"evidence: {evidence_to_commit}",
             ]
         ).strip()
 
-        retrieved = self.retrieve(query, k=self.cfg.retrieve_k)
-
-        # group retrieved by type
+        retrieved = self._retrieve(query, k=self.cfg.retrieve_k, lang="cn")
+        # group by type
         reframes = [x for x in retrieved if x.get("type") == "reframe"][:2]
         moves = [x for x in retrieved if x.get("type") == "move"][:3]
         safeguards = [x for x in retrieved if x.get("type") == "safeguard"][:2]
 
+        # slots for filling
+        slots = dict(
+            decision=decision,
+            options=options,
+            status_6m=status_6m,
+            status_2y=status_2y,
+            a_name=a_name,
+            b_name=b_name,
+            a_best=a_best,
+            b_best=b_best,
+            a_worst=a_worst,
+            b_worst=b_worst,
+            constraints_str=constraints_str,
+            priority=priority,
+            regret=regret,
+            evidence_to_commit=evidence_to_commit,
+            evidence_to_stop=evidence_to_stop,
+            trial_pick=trial_pick,
+            worst_focus=worst_focus,
+        )
+
+        reframes_f = self._fill_items(reframes, slots)
+        moves_f = self._fill_items(moves, slots)
+        safeguards_f = self._fill_items(safeguards, slots)
+
         def fmt_cards(items: List[Dict[str, Any]]) -> str:
             if not items:
                 return "（无）"
-            return "\n\n".join([f"**{x['title']}**\n{x['text']}" for x in items])
+            blocks = []
+            for x in items:
+                blocks.append(f"**{x.get('title','')}**\n{x.get('text_filled','')}")
+            return "\n\n".join(blocks)
 
         # ---- precompute (avoid f-string backslash issues) ----
         reasons_bullets = _bulletize("\n".join(reasons))
@@ -247,17 +436,20 @@ class DecisionEngine:
 ### 7.2 触发的依据
 {reasons_bullets}
 
-## 8. 检索增强（开源模型）：与你这个决策最贴的重构/动作/护栏
-> 这部分来自语义检索：根据你输入的语义，自动匹配行动库/重构库的最相关条目。
+### 7.3 基于你输入的“解释段”（更像你自己的版本）
+{explanation_personal}
+
+## 8. 检索增强（半模板 slot-filling）：更贴你的语境的重构/动作/护栏
+> 这部分来自语义检索 + 半模板填槽：用你写的最坏结果/约束/证据门槛把条目“实例化”。
 
 ### 8.1 Reframes（问题重构）
-{fmt_cards(reframes)}
+{fmt_cards(reframes_f)}
 
 ### 8.2 Moves（可逆的小步试探）
-{fmt_cards(moves)}
+{fmt_cards(moves_f)}
 
 ### 8.3 Safeguards（降低最坏结果概率）
-{fmt_cards(safeguards)}
+{fmt_cards(safeguards_f)}
 
 ## 9. 证据门槛（用证据而不是情绪做决定）
 - 加码/承诺的证据：{evidence_to_commit.strip() if evidence_to_commit.strip() else "（未填写）"}
@@ -281,24 +473,45 @@ class DecisionEngine:
         return memo
 
     def build_sprint_en(self, payload: Dict[str, Any]) -> str:
-        # Minimal English sprint with retrieval-augmented moves/safeguards (open-source, no key)
+        # Minimal English sprint with slot-filled retrieval items
         decision = (payload.get("decision") or "").strip()
         baseline_12m = (payload.get("baseline_12m") or "").strip()
         best = (payload.get("best") or "").strip()
         worst = (payload.get("worst") or "").strip()
         evidence = (payload.get("evidence") or "").strip()
 
-        query = "\n".join([decision, baseline_12m, best, worst, evidence]).strip()
-        retrieved = self.retrieve(query, k=self.cfg.retrieve_k)
+        constraints_str = _safe_str(payload.get("constraints_str") or "time, money, family, emotional bandwidth")
+        status_2y = _safe_str(payload.get("status_2y") or baseline_12m)
 
-        moves = [x for x in retrieved if x.get("type") == "move"][:3]
-        safeguards = [x for x in retrieved if x.get("type") == "safeguard"][:2]
+        # Try to create a "worst focus"
+        worst_focus = _first_sentence(worst) if worst else "(empty worst-case)"
+
+        # Retrieve EN items
+        query = "\n".join([decision, baseline_12m, best, worst, evidence]).strip()
+        retrieved = self._retrieve(query, k=self.cfg.retrieve_k, lang="en")
+
         reframes = [x for x in retrieved if x.get("type") == "reframe"][:1]
+        moves = [x for x in retrieved if x.get("type") == "move"][:2]
+        safeguards = [x for x in retrieved if x.get("type") == "safeguard"][:1]
+
+        slots = dict(
+            decision=decision,
+            status_2y=status_2y,
+            constraints_str=constraints_str,
+            evidence_to_commit=evidence,
+            evidence_to_stop=_safe_str(payload.get("evidence_to_stop") or ""),
+            trial_pick=_safe_str(payload.get("trial_pick") or "your chosen path"),
+            worst_focus=worst_focus,
+        )
+
+        reframes_f = self._fill_items(reframes, slots)
+        moves_f = self._fill_items(moves, slots)
+        safeguards_f = self._fill_items(safeguards, slots)
 
         def card(items: List[Dict[str, Any]]) -> str:
             if not items:
                 return "- (none)"
-            return "\n".join([f"- **{x['title']}**: {x['text']}" for x in items])
+            return "\n".join([f"- **{x.get('title','')}**: {x.get('text_filled','')}" for x in items])
 
         out = f"""# Decision Sprint Summary
 Generated: {datetime.now().strftime('%Y-%m-%d %H:%M')}
@@ -320,14 +533,14 @@ Generated: {datetime.now().strftime('%Y-%m-%d %H:%M')}
 
 ---
 
-## Reframe (retrieved)
-{card(reframes)}
+## Reframe (slot-filled retrieval)
+{card(reframes_f)}
 
-## Suggested moves (retrieved)
-{card(moves)}
+## Suggested moves (slot-filled retrieval)
+{card(moves_f)}
 
-## Safeguards (retrieved)
-{card(safeguards)}
+## Safeguard (slot-filled retrieval)
+{card(safeguards_f)}
 
 ---
 
