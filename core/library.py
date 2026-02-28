@@ -1,128 +1,159 @@
 # core/library.py
-from __future__ import annotations
+
+# 半模板：不要写死。让同一条条目根据用户输入变化。
+# 必用 slots 示例：
+# - {constraints_str}, {trial_pick}, {commit_signal_short}, {stop_signal_short}
+# - {risk_variables_bullets}, {risk_actions_bullets}
+# - {a_name}, {b_name}, {a_worst}, {b_worst}
 
 PLAYBOOK = [
     # -------------------------
-    # CN - Reframes
+    # Reframes（更像你的“认知校准”）
     # -------------------------
     {
-        "id": "cn_reframe_optionality",
         "lang": "cn",
         "type": "reframe",
-        "title": "把“选 A 还是 B”重构为“用可控不确定性换选择权”",
+        "title": "先把系统降温：稳定是判断准确性的前置条件",
         "text": (
-            "你表面上在纠结：{decision}\n\n"
-            "更底层的问题往往是：你是否愿意用一段“可控的不确定性”，去换取未来更大的选择权（Optionality）。\n"
-            "在你目前的约束（{constraints_str}）下，最靠谱的策略通常不是“一次性押注”，而是“可逆的试探”。"
+            "当系统处于高波动（睡眠差/冲突多/信息过载）时，你以为自己在“思考”，其实更像在做噪声放大。\n"
+            "在你的约束：{constraints_str} 下，先把决策降级为可逆实验：用 14 天换证据，而不是用焦虑换结论。\n"
+            "本轮试探候选：{trial_pick}。\n"
+            "一句话：先把波动降下来，再让理性上场。"
         ),
-        "tags": ["optionality", "reframe", "trial", "constraints"],
+        "tags": ["stability", "volatility", "calibration"]
     },
     {
-        "id": "cn_reframe_baseline_cost",
         "lang": "cn",
         "type": "reframe",
-        "title": "把“拖着不选”视为一种有成本的选择",
+        "title": "地图不是领土：别把脑内推演当成现实证据",
         "text": (
-            "你写的 Baseline（2年）是：{status_2y}\n\n"
-            "这意味着“不行动”也在持续付费：机会窗口、信心、节奏、选择权。\n"
-            "所以关键不是“完美决定”，而是尽快做一个能降低不确定性的动作。"
+            "你脑中对路径的想象（地图）与路径真实的反馈（领土）经常不一致。\n"
+            "所以这不是“选 A 还是 B”的问题，而是：我能做什么动作，让真实反馈在 14 天内出现？\n"
+            "继续信号（1条）：{commit_signal_short}\n"
+            "止损信号（1条）：{stop_signal_short}\n"
+            "规则：没有反馈的自洽，只是更精致的拖延。"
         ),
-        "tags": ["baseline", "opportunity_cost", "reframe"],
+        "tags": ["map-territory", "evidence", "reality"]
     },
     {
-        "id": "cn_reframe_cooling",
         "lang": "cn",
         "type": "reframe",
-        "title": "先降波动，再决策：稳定是高质量判断的前提",
+        "title": "把后悔从情绪变成指标：你在优化的是选择权",
         "text": (
-            "如果你当前处于高波动状态（睡眠差/冲突多/信息过载），决策质量会显著下降。\n"
-            "在这种情况下，先把系统降温：把决策“降级”为两周试探，用证据驱动，而不是情绪驱动。"
+            "你真正怕的通常不是“选错”，而是：窗口变窄、路径锁定、未来选项减少。\n"
+            "在 {constraints_str} 的约束下，最划算的不是一次性押注，而是用小步试探提高选择权：\n"
+            "- 让继续信号更容易发生：{commit_signal_short}\n"
+            "- 让止损信号更早出现：{stop_signal_short}\n"
+            "你在做的不是“人生定案”，而是“选择权经营”。"
         ),
-        "tags": ["stability", "cooling", "emotion"],
+        "tags": ["optionality", "regret", "decision"]
+    },
+    {
+        "lang": "cn",
+        "type": "reframe",
+        "title": "反脆弱视角：把波动当成系统输入，而不是人格失败",
+        "text": (
+            "你不需要把不确定性消灭，你需要把它变成可控输入：\n"
+            "把“最坏结果”拆成变量→对每个变量给一个动作→把最坏概率下降 20%。\n"
+            "这不是鸡血，是系统工程：你用动作降低尾部风险，用证据换取更大的上行空间。\n"
+            "本轮先做可逆动作，别急着做不可逆承诺。"
+        ),
+        "tags": ["antifragile", "risk", "system"]
     },
 
     # -------------------------
-    # CN - Moves
+    # Moves（更像你的“闭环与输出”）
     # -------------------------
     {
-        "id": "cn_move_14d_sprint",
         "lang": "cn",
         "type": "move",
-        "title": "14 天试探：把决策变成一次可验证的小实验",
+        "title": "14 天闭环：把“想清楚”换成“做出证据”",
         "text": (
-            "不要今天就做“终身决定”。\n"
-            "做一个 14 天试探：总投入 <=10 小时，必须产出可展示的结果（作品/报告/项目/访谈纪要）。\n"
-            "你这次试探优先对齐的证据门槛是：{commit_signal_short}\n"
-            "止损/调整信号是：{stop_signal_short}"
+            "做一个 14 天试探：总投入 <=10 小时，必须产出可展示结果（报告/小 demo/一页方案/复盘）。\n"
+            "继续条件（1条）：{commit_signal_short}\n"
+            "止损/调整（1条）：{stop_signal_short}\n"
+            "你要的不是更完整的解释，而是更早的反馈。"
         ),
-        "tags": ["sprint", "test", "evidence"],
+        "tags": ["experiment", "feedback", "reversible"]
     },
     {
-        "id": "cn_move_info_interviews",
         "lang": "cn",
         "type": "move",
-        "title": "2 次信息访谈：用“真实门槛”替代“脑补焦虑”",
+        "title": "2 次信息访谈：用真实门槛替代脑补焦虑",
         "text": (
-            "在你准备走的路径里，找 2 个已经走在前面的人做信息访谈（20–30 分钟即可）。\n"
-            "你要问的不是“你觉得我行不行”，而是：招聘/录取门槛、常见失败模式、最快证明方式、以及在你约束（{constraints_str}）下他们会怎么做。"
+            "找 2 个走在你目标路径前面的人，做 20–30 分钟信息访谈。\n"
+            "你要拿到的是：门槛、失败模式、最快证明方式、以及在 {constraints_str} 约束下的最小动作。\n"
+            "访谈结束后，把“我觉得”替换成“我看到的证据门槛”：{commit_signal_short}"
         ),
-        "tags": ["interview", "market", "evidence"],
+        "tags": ["interview", "threshold", "calibration"]
     },
     {
-        "id": "cn_move_proof_of_work",
         "lang": "cn",
         "type": "move",
-        "title": "5 小时可展示输出：用作品替代空想",
+        "title": "5 小时可展示输出：用作品替代空转",
         "text": (
-            "在 {trial_pick} 这条试探路径上，做一个 5 小时以内的可展示输出。\n"
-            "例如：一份分析报告/一页 PRD/一个小 demo/一份作品集。\n"
-            "目的不是完美，而是让下一步（继续/止损/换方向）更明显。"
+            "挑一个 5 小时以内的可展示输出（报告/小demo/一页PRD/复盘）。\n"
+            "它的作用不是完美，而是让下一步更清晰：你更接近继续信号，还是更接近止损信号？\n"
+            "如果你连 5 小时都拿不出来，说明你需要先处理的是系统降温与时间结构，而不是路径选择。"
         ),
-        "tags": ["portfolio", "demo", "proof"],
+        "tags": ["output", "portfolio", "proof-of-work"]
+    },
+    {
+        "lang": "cn",
+        "type": "move",
+        "title": "第二大脑式记录：把决策从脑内搬到纸面上",
+        "text": (
+            "把“纠结”外化成三个清单（各写 3 条即可）：\n"
+            "1) 我能控制的抓手（来自你的可控变量）\n"
+            "2) 我最怕的 2–3 个风险变量（来自最坏结果）\n"
+            "3) 我认可的证据门槛（继续/止损各 1 条）\n"
+            "然后按证据门槛行动：{commit_signal_short} / {stop_signal_short}\n"
+            "外化不是记录癖，是减少认知幻觉。"
+        ),
+        "tags": ["second-brain", "externalize", "clarity"]
     },
 
     # -------------------------
-    # CN - Safeguards
+    # Safeguards（更像你的“把恐惧变量化”）
     # -------------------------
     {
-        "id": "cn_safeguard_worst_to_controls",
         "lang": "cn",
         "type": "safeguard",
         "title": "把最坏结果拆成变量：每个变量给一个“降低20%概率”的动作",
         "text": (
-            "你写的最坏结果之一是：{worst_focus}\n\n"
-            "把它拆成风险变量（越具体越好）：\n"
-            "{risk_variables_bullets}\n\n"
-            "对每个变量，做一个“把概率降低 20%”的最小动作：\n"
-            "{risk_actions_bullets}"
+            "{safeguard_note}\n"
+            "你不需要一次性“变勇敢”。你只需要把恐惧翻译成变量，然后对变量动手。\n\n"
+            "关键风险变量：\n{risk_variables_bullets}\n\n"
+            "降低 20% 概率的最小动作：\n{risk_actions_bullets}\n\n"
+            "规则：48 小时内先做 1 个动作，别等“心情好/想清楚”。"
         ),
-        "tags": ["risk", "control", "guardrail"],
+        "tags": ["risk", "control", "reduce-probability"]
     },
     {
-        "id": "cn_safeguard_stop_signal",
         "lang": "cn",
         "type": "safeguard",
-        "title": "预先写下止损信号：避免越陷越深",
+        "title": "提前写止损：你是在做实验，不是在做信仰",
         "text": (
-            "在你选择 {trial_pick} 试探时，提前写下止损信号（健康/绩效/家庭稳定/财务 runway）。\n"
-            "一旦触发，就暂停或调整，而不是用更大投入去“硬扛证明自己”。"
+            "如果你不提前写止损，后面你会用沉没成本把自己锁死。\n"
+            "把止损写成一句可执行的触发器（越具体越好）：\n"
+            "- 止损/调整（1条）：{stop_signal_short}\n"
+            "这不是悲观，这是给未来的自己留出口：把错误变小，把回头变容易。"
         ),
-        "tags": ["stop", "risk", "runway"],
+        "tags": ["stop-signal", "sunk-cost", "guardrail"]
     },
 
     # -------------------------
-    # EN - keep minimal (optional)
+    # Bonus（更像你：在恐惧里仍能行动）
     # -------------------------
     {
-        "id": "en_move_14d_sprint",
-        "lang": "en",
+        "lang": "cn",
         "type": "move",
-        "title": "14-day test: reduce uncertainty by ~20%",
+        "title": "在恐惧里仍能行动：把“情绪”与“动作”解耦",
         "text": (
-            "Run a 14-day test (<10 hours) that produces visible output.\n"
-            "Primary continue signal: {commit_signal_short}\n"
-            "Primary stop signal: {stop_signal_short}"
+            "你不需要等“有信心”才行动。信心常常是行动的副产品。\n"
+            "现在只做一个最小动作（<=30 分钟）：把最坏结果写成变量，并为其中一个变量写出 3 个动作，48 小时执行 1 个。\n"
+            "如果你要一个可验证的方向：用 {commit_signal_short} 作为下一次复盘的硬指标。"
         ),
-        "tags": ["sprint", "evidence"],
+        "tags": ["tools", "action", "courage"]
     },
 ]
