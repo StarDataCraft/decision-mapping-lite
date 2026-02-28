@@ -8,6 +8,7 @@ import re
 
 from core.library import PLAYBOOK
 from core.embedder import HybridEmbedder, EmbeddingConfig
+from core.reranker import rerank, RerankConfig
 
 
 def _text_richness_score(text: str) -> int:
@@ -105,89 +106,59 @@ def _safe_format(template: str, slots: Dict[str, Any]) -> str:
         return template
 
 
-def _extract_risk_variables(worst_text: str) -> List[str]:
-    """
-    将“最坏结果”拆成 2~4 个风险变量（启发式）：
-    - 先按分隔符拆
-    - 再做轻量清洗
-    """
-    if not worst_text:
-        return []
-    t = worst_text.replace("；", "，").replace("。", "，").replace("、", "，")
-    parts = [p.strip() for p in t.split("，") if p.strip()]
-    # 去掉过长句，保留更像“变量”的短语
-    cleaned = []
-    for p in parts:
-        p = re.sub(r"^同时|^而且|^以及|^并且", "", p).strip()
-        if not p:
-            continue
-        # 控制长度
-        if len(p) > 30:
-            p = p[:30] + "…"
-        if p not in cleaned:
-            cleaned.append(p)
-    return cleaned[:4]
-
-
-def _risk_actions_for(vars_: List[str], trial_pick: str) -> List[str]:
-    """
-    对每个风险变量给一个“降低20%概率”的动作（rule-based mapping）。
-    """
-    actions = []
-    for v in vars_:
-        if any(k in v for k in ["不匹配", "不合适", "不对口"]):
-            actions.append("用一次信息访谈 + 一次岗位JD反向拆解：把“匹配”量化为3条硬条件，48小时内改一版简历/项目对齐。")
-        elif any(k in v for k in ["压力", "焦虑", "崩", "内耗"]):
-            actions.append("先降波动：固定睡眠+每天90分钟深度块；把任务降级为14天试探，只做1个最小交付。")
-        elif any(k in v for k in ["成长慢", "没有成长", "停滞"]):
-            actions.append("给自己加一个“成长仪表盘”：每周产出1个可展示成果（报告/作品/复盘），并找1个外部反馈点。")
-        elif any(k in v for k in ["成本", "转向", "窗口", "错过"]):
-            actions.append("做对冲：即便主路径是“备考/学习”，也保留每周2小时的就业准备（投递/内推/作品集更新）。")
-        else:
-            actions.append(f"围绕“{v}”写出3个可控抓手，并在48小时内做其中1个（目标是让风险概率下降20%）。")
-    # 去重 + 控制数量
-    out = []
-    for a in actions:
-        if a not in out:
-            out.append(a)
-    return out[:4]
-
-
-def _bullets(lines: List[str]) -> str:
-    if not lines:
-        return "（无）"
-    return "\n".join([f"- {x}" for x in lines])
-
-
 @dataclass
 class EngineConfig:
     embed_model: str = "sentence-transformers/all-MiniLM-L6-v2"
     retrieve_k: int = 6
+    retrieve_pool: int = 30  # topN before rerank
 
 
 class DecisionEngine:
-    BUILD_ID = "2026-02-28-slotfill-v2-cleaner"
+    BUILD_ID = "2026-02-28-rerank-lite-v1"
 
     def __init__(self, cfg: EngineConfig):
         self.cfg = cfg
         self.embedder = HybridEmbedder(EmbeddingConfig(model_name=cfg.embed_model))
+        self.rerank_cfg = RerankConfig()
+
         self._pb_texts = [
             f"{x.get('lang','')} | {x['type']} | {x['title']}\n{x['text']}\nTags: {', '.join(x.get('tags', []))}"
             for x in PLAYBOOK
         ]
 
-    def _retrieve(self, query: str, k: int, lang: str) -> List[Dict[str, Any]]:
-        idxs = self.embedder.top_k(query, self._pb_texts, k=min(max(k * 2, 8), len(PLAYBOOK)))
+    def _retrieve_rerank(self, query: str, k: int, lang: str) -> List[Dict[str, Any]]:
+        """
+        Two-stage retrieval:
+          1) embedding topN (retrieve_pool)
+          2) lightweight rerank (no extra model) -> topK
+        """
+        pool = min(max(self.cfg.retrieve_pool, k * 3), len(PLAYBOOK))
+        idxs, scores = self.embedder.top_k_with_scores(query, self._pb_texts, k=pool)
         candidates = [PLAYBOOK[i] for i in idxs]
-        filtered = [x for x in candidates if x.get("lang") == lang]
-        if len(filtered) >= k:
-            return filtered[:k]
-        for x in candidates:
-            if x not in filtered:
-                filtered.append(x)
-            if len(filtered) >= k:
+        cand_scores = scores
+
+        # language prefer
+        # keep all for rerank but give lang-matched a small bonus via text itself; simplest:
+        # we do post-filter: keep enough lang candidates
+        reranked = rerank(query, candidates, cand_scores, self.rerank_cfg)
+
+        # take lang first if possible
+        out: List[Dict[str, Any]] = []
+        for item, _ in reranked:
+            if item.get("lang") == lang:
+                out.append(item)
+            if len(out) >= k:
                 break
-        return filtered[:k]
+
+        # if not enough, fill with any language
+        if len(out) < k:
+            for item, _ in reranked:
+                if item not in out:
+                    out.append(item)
+                if len(out) >= k:
+                    break
+
+        return out[:k]
 
     def _fill_items(self, items: List[Dict[str, Any]], slots: Dict[str, Any]) -> List[Dict[str, Any]]:
         out: List[Dict[str, Any]] = []
@@ -196,6 +167,30 @@ class DecisionEngine:
             y["text_filled"] = _safe_format(y.get("text", ""), slots)
             out.append(y)
         return out
+
+    def _ensure_safeguards(self, items: List[Dict[str, Any]], lang: str, need: int = 1) -> List[Dict[str, Any]]:
+        """
+        If safeguards are empty after retrieval, hard-pick from PLAYBOOK by type.
+        Ensures Safeguards section never becomes (无).
+        """
+        safeguards = [x for x in items if x.get("type") == "safeguard"]
+        if len(safeguards) >= need:
+            return safeguards[:need]
+
+        # hard fallback
+        pool = [x for x in PLAYBOOK if x.get("lang") == lang and x.get("type") == "safeguard"]
+        # if still none, fallback any lang
+        if not pool:
+            pool = [x for x in PLAYBOOK if x.get("type") == "safeguard"]
+
+        # take first few unique
+        for x in pool:
+            if x not in safeguards:
+                safeguards.append(x)
+            if len(safeguards) >= need:
+                break
+
+        return safeguards[:need]
 
     def build_memo_cn(self, payload: Dict[str, Any]) -> str:
         decision = (payload.get("decision") or "").strip()
@@ -281,9 +276,10 @@ class DecisionEngine:
         else:
             trial_pick = a_name if a_manage > b_manage else b_name
 
-        # ---- personalization ----
+        # ---- personalization (explain) ----
         a_best_control = _pick_most_concrete_line(a_controls)
         b_best_control = _pick_most_concrete_line(b_controls)
+
         risk_terms = []
         for w in ["压力", "成长", "不匹配", "窗口", "落榜", "焦虑", "家庭", "自信", "成本", "拖延", "内耗"]:
             if w in (a_worst + " " + b_worst):
@@ -302,27 +298,22 @@ class DecisionEngine:
 你已经把不确定性拆成了可行动作（抓手），也识别了风险核心（你在怕什么），下一步只需要用证据门槛把试探闭环起来。
 """.strip()
 
-        # ---- NEW: short signals for slot-filling ----
+        # short signals for slot filling
         commit_signal_short = _pick_most_concrete_line(evidence_to_commit) or "（未填写继续信号）"
         stop_signal_short = _pick_most_concrete_line(evidence_to_stop) or "（未填写止损信号）"
 
-        # ---- NEW: risk variables + actions ----
         worst_focus = _first_sentence(a_worst) if a_worst.strip() else _first_sentence(b_worst)
         worst_focus = worst_focus or "（未填写最坏结果）"
-        risk_vars = _extract_risk_variables(worst_focus)
-        risk_actions = _risk_actions_for(risk_vars, trial_pick)
-        risk_variables_bullets = _bullets(risk_vars)
-        risk_actions_bullets = _bullets(risk_actions)
 
-        # ---- retrieval ----
-        query = "\n".join(
-            [decision, options, status_2y, a_worst, b_worst, priority, constraints_str, commit_signal_short]
-        ).strip()
+        # ---- retrieval + rerank ----
+        query = "\n".join([decision, options, status_2y, a_worst, b_worst, priority, constraints_str, commit_signal_short]).strip()
+        retrieved = self._retrieve_rerank(query, k=self.cfg.retrieve_k, lang="cn")
 
-        retrieved = self._retrieve(query, k=self.cfg.retrieve_k, lang="cn")
         reframes = [x for x in retrieved if x.get("type") == "reframe"][:2]
         moves = [x for x in retrieved if x.get("type") == "move"][:3]
         safeguards = [x for x in retrieved if x.get("type") == "safeguard"][:2]
+        if not safeguards:
+            safeguards = self._ensure_safeguards(retrieved, lang="cn", need=1)
 
         slots = dict(
             decision=decision,
@@ -342,11 +333,8 @@ class DecisionEngine:
             evidence_to_stop=evidence_to_stop,
             trial_pick=trial_pick,
             worst_focus=worst_focus,
-            # new slots
             commit_signal_short=commit_signal_short,
             stop_signal_short=stop_signal_short,
-            risk_variables_bullets=risk_variables_bullets,
-            risk_actions_bullets=risk_actions_bullets,
         )
 
         reframes_f = self._fill_items(reframes, slots)
@@ -415,8 +403,8 @@ class DecisionEngine:
 ### 7.3 基于你输入的“解释段”（更像你自己的版本）
 {explanation_personal}
 
-## 8. 检索增强（半模板 slot-filling）：更贴你的语境的重构/动作/护栏
-> 这部分来自语义检索 + 半模板填槽：避免大段抄写，优先抽“最关键的一条继续信号/止损信号”并把最坏结果拆成变量。
+## 8. 检索增强（两阶段：embedding→轻量rerank）
+> 这部分：先用 embedding 召回一批候选，再用“零模型轻量 rerank”重排（字符ngram+类型偏置），提高覆盖与稳定性。
 
 ### 8.1 Reframes（问题重构）
 {fmt_cards(reframes_f)}
