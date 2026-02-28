@@ -1,14 +1,16 @@
 # core/engine.py
 from __future__ import annotations
+
 from dataclasses import dataclass
 from typing import Dict, List, Any
 from datetime import datetime
 
 from core.library import PLAYBOOK
-from core.embedder import LocalEmbedder, EmbeddingConfig
+from core.embedder import HybridEmbedder, EmbeddingConfig
 
 
 def _text_richness_score(text: str) -> int:
+    """粗略判断描述是否具体（越具体越可推导）。0~3"""
     if not text or not text.strip():
         return 0
     t = text.strip()
@@ -24,6 +26,7 @@ def _text_richness_score(text: str) -> int:
 
 
 def _worst_severity(worst: str) -> int:
+    """最坏结果严重度：0/1/2（启发式）"""
     if not worst:
         return 0
     severe_keywords = ["崩", "失业", "毁", "无法", "严重", "抑郁", "破产", "健康", "关系破裂", "绩效很差", "重病"]
@@ -31,6 +34,7 @@ def _worst_severity(worst: str) -> int:
 
 
 def _bulletize(text: str) -> str:
+    """把多行文本格式化成 markdown 列表"""
     if not text:
         return "（未填写）"
     t = text.strip()
@@ -42,14 +46,22 @@ def _bulletize(text: str) -> str:
 
 @dataclass
 class EngineConfig:
+    # 纯开源、本地跑：CPU 友好（Streamlit Cloud 推荐）
     embed_model: str = "sentence-transformers/all-MiniLM-L6-v2"
     retrieve_k: int = 6
 
 
 class DecisionEngine:
+    """
+    Hybrid engine:
+    - Rule-based, explainable reasoning (stable + controllable)
+    - Retrieval-augmented suggestions using open-source embeddings (no API key)
+      with safe fallback to TF-IDF (still no key) if the embedding model fails to load.
+    """
+
     def __init__(self, cfg: EngineConfig):
         self.cfg = cfg
-        self.embedder = LocalEmbedder(EmbeddingConfig(model_name=cfg.embed_model))
+        self.embedder = HybridEmbedder(EmbeddingConfig(model_name=cfg.embed_model))
 
         # Prepare playbook texts for retrieval
         self._pb_texts = [
@@ -157,22 +169,26 @@ class DecisionEngine:
         else:
             trial_pick = a_name if a_manage > b_manage else b_name
 
-        # ---- retrieval augmentation (SOTA-ish) ----
-        query = "\n".join([
-            decision, options, status_2y,
-            f"{a_name} worst: {a_worst}",
-            f"{b_name} worst: {b_worst}",
-            f"priority: {priority}",
-            f"constraints: {', '.join(constraints) if constraints else ''}",
-            f"evidence: {evidence_to_commit}",
-        ]).strip()
+        # ---- retrieval augmentation (open-source, no key) ----
+        query = "\n".join(
+            [
+                decision,
+                options,
+                status_2y,
+                f"{a_name} worst: {a_worst}",
+                f"{b_name} worst: {b_worst}",
+                f"priority: {priority}",
+                f"constraints: {', '.join(constraints) if constraints else ''}",
+                f"evidence: {evidence_to_commit}",
+            ]
+        ).strip()
 
         retrieved = self.retrieve(query, k=self.cfg.retrieve_k)
 
         # group retrieved by type
-        reframes = [x for x in retrieved if x["type"] == "reframe"][:2]
-        moves = [x for x in retrieved if x["type"] == "move"][:3]
-        safeguards = [x for x in retrieved if x["type"] == "safeguard"][:2]
+        reframes = [x for x in retrieved if x.get("type") == "reframe"][:2]
+        moves = [x for x in retrieved if x.get("type") == "move"][:3]
+        safeguards = [x for x in retrieved if x.get("type") == "safeguard"][:2]
 
         def fmt_cards(items: List[Dict[str, Any]]) -> str:
             if not items:
@@ -231,7 +247,7 @@ class DecisionEngine:
 ### 7.2 触发的依据
 {reasons_bullets}
 
-## 8. 检索增强（SOTA-ish）：与你这个决策最贴的重构/动作/护栏
+## 8. 检索增强（开源模型）：与你这个决策最贴的重构/动作/护栏
 > 这部分来自语义检索：根据你输入的语义，自动匹配行动库/重构库的最相关条目。
 
 ### 8.1 Reframes（问题重构）
@@ -265,7 +281,7 @@ class DecisionEngine:
         return memo
 
     def build_sprint_en(self, payload: Dict[str, Any]) -> str:
-        # Minimal English sprint with retrieval-augmented moves
+        # Minimal English sprint with retrieval-augmented moves/safeguards (open-source, no key)
         decision = (payload.get("decision") or "").strip()
         baseline_12m = (payload.get("baseline_12m") or "").strip()
         best = (payload.get("best") or "").strip()
@@ -274,9 +290,10 @@ class DecisionEngine:
 
         query = "\n".join([decision, baseline_12m, best, worst, evidence]).strip()
         retrieved = self.retrieve(query, k=self.cfg.retrieve_k)
-        moves = [x for x in retrieved if x["type"] == "move"][:3]
-        safeguards = [x for x in retrieved if x["type"] == "safeguard"][:2]
-        reframes = [x for x in retrieved if x["type"] == "reframe"][:1]
+
+        moves = [x for x in retrieved if x.get("type") == "move"][:3]
+        safeguards = [x for x in retrieved if x.get("type") == "safeguard"][:2]
+        reframes = [x for x in retrieved if x.get("type") == "reframe"][:1]
 
         def card(items: List[Dict[str, Any]]) -> str:
             if not items:
