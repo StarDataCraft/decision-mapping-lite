@@ -64,7 +64,6 @@ def _safe_format(template: str, slots: Dict[str, Any]) -> str:
     try:
         return template.format_map(_SafeDict({k: _safe_str(v) for k, v in slots.items()}))
     except Exception:
-        # In case template contains unexpected braces etc.
         return template
 
 
@@ -108,8 +107,7 @@ def _pick_most_concrete_control(controls_text: str) -> str:
 def _extract_risk_keywords(text: str, top_n: int = 3) -> List[str]:
     """
     Simple keyword extraction without ML:
-    - Pull short Chinese phrases around separators
-    - Plus a small curated list of 'risk' terms
+    - A tiny curated list + light frequency chunks
     """
     if not text:
         return []
@@ -118,24 +116,19 @@ def _extract_risk_keywords(text: str, top_n: int = 3) -> List[str]:
     curated = ["压力", "成长", "不匹配", "错过", "窗口", "失败", "落榜", "焦虑", "家庭", "自信", "成本", "拖延", "内耗"]
     hits = [w for w in curated if w in text]
 
-    # Extract candidate chunks (2~8 chars Chinese sequences)
     chunks = re.findall(r"[\u4e00-\u9fff]{2,8}", t)
-    # Remove very common stop-like words
     stop = {"可能", "同时", "但是", "因为", "如果", "这样", "这个", "那个", "自己", "很多", "然后"}
     chunks = [c for c in chunks if c not in stop]
 
-    # Frequency-based (very light)
     freq: Dict[str, int] = {}
     for c in chunks:
         freq[c] = freq.get(c, 0) + 1
 
-    # Start with curated hits (order-preserving)
     out: List[str] = []
     for h in hits:
         if h not in out:
             out.append(h)
 
-    # Add frequent chunks
     sorted_chunks = sorted(freq.items(), key=lambda kv: kv[1], reverse=True)
     for c, _ in sorted_chunks:
         if c not in out:
@@ -149,7 +142,6 @@ def _extract_risk_keywords(text: str, top_n: int = 3) -> List[str]:
 def _first_sentence(text: str) -> str:
     if not text:
         return ""
-    # Split by Chinese/English sentence punctuation
     parts = re.split(r"[。.!?！？]+", text.strip())
     for p in parts:
         if p.strip():
@@ -162,40 +154,30 @@ def _first_sentence(text: str) -> str:
 # ---------------------------
 @dataclass
 class EngineConfig:
-    # 纯开源、本地跑：CPU 友好（Streamlit Cloud 推荐）
     embed_model: str = "sentence-transformers/all-MiniLM-L6-v2"
     retrieve_k: int = 6
 
 
 class DecisionEngine:
-    """
-    Hybrid engine:
-    - Rule-based, explainable reasoning (stable + controllable)
-    - Retrieval-augmented suggestions using open-source embeddings (no API key)
-    - Slot-filling playbook items + input-derived explanation paragraphs
-    """
+    BUILD_ID = "2026-02-28-slotfill-v1"
 
     def __init__(self, cfg: EngineConfig):
         self.cfg = cfg
         self.embedder = HybridEmbedder(EmbeddingConfig(model_name=cfg.embed_model))
 
-        # Prepare playbook texts for retrieval (include lang/type/title/text)
         self._pb_texts = [
             f"{x.get('lang','')} | {x['type']} | {x['title']}\n{x['text']}\nTags: {', '.join(x.get('tags', []))}"
             for x in PLAYBOOK
         ]
 
     def _retrieve(self, query: str, k: int, lang: str) -> List[Dict[str, Any]]:
-        """Retrieve top-k from entire playbook, then filter by lang; backfill if needed."""
         idxs = self.embedder.top_k(query, self._pb_texts, k=min(max(k * 2, 8), len(PLAYBOOK)))
         candidates = [PLAYBOOK[i] for i in idxs]
 
-        # Filter by lang if possible
         filtered = [x for x in candidates if x.get("lang") == lang]
         if len(filtered) >= k:
             return filtered[:k]
 
-        # Backfill with any language if not enough
         for x in candidates:
             if x not in filtered:
                 filtered.append(x)
@@ -212,7 +194,6 @@ class DecisionEngine:
         return out
 
     def build_memo_cn(self, payload: Dict[str, Any]) -> str:
-        # ---- unpack ----
         decision = (payload.get("decision") or "").strip()
         options = payload.get("options") or ""
         status_6m = payload.get("status_6m") or ""
@@ -239,7 +220,6 @@ class DecisionEngine:
 
         constraints_str = "、".join(constraints) if constraints else "（未填写）"
 
-        # ---- rule features ----
         optionality_pref = priority == "长期选择权（Optionality）"
         regret_try = regret == "没有尝试"
 
@@ -276,7 +256,6 @@ class DecisionEngine:
             score_min_regret += 1
             reasons.append(f"你当前约束较多（{constraint_count}项）→ 更适合分阶段，而不是一次性押注。")
 
-        # ---- decide ----
         if score_min_regret >= 4:
             conclusion = "更偏向「最小后悔路径（Minimum Regret Path）」：用可控的不确定性，去换取长期选择权的上升。"
             strategy = (
@@ -300,7 +279,6 @@ class DecisionEngine:
                 "设定一个决策时间点：2–4 周后用补齐的信息再做一次 Decision Mapping。",
             ]
 
-        # ---- trial pick ----
         a_manage = a_control_rich - a_worst_sev
         b_manage = b_control_rich - b_worst_sev
         if a_manage == b_manage:
@@ -308,11 +286,9 @@ class DecisionEngine:
         else:
             trial_pick = a_name if a_manage > b_manage else b_name
 
-        # ---- Input-derived personalization (NEW) ----
         a_best_control = _pick_most_concrete_control(a_controls)
         b_best_control = _pick_most_concrete_control(b_controls)
 
-        # Pick a "worst focus" phrase to inject into safeguards
         worst_focus = _first_sentence(a_worst) if a_worst.strip() else _first_sentence(b_worst)
         if not worst_focus:
             worst_focus = "（未填写最坏结果）"
@@ -331,7 +307,6 @@ class DecisionEngine:
 你已经把不确定性拆成了可行动作（抓手），也识别了风险核心（你在怕什么），下一步只需要用证据门槛把试探闭环起来。
 """.strip()
 
-        # ---- Retrieval augmentation with slot-filling (NEW) ----
         query = "\n".join(
             [
                 decision,
@@ -346,12 +321,10 @@ class DecisionEngine:
         ).strip()
 
         retrieved = self._retrieve(query, k=self.cfg.retrieve_k, lang="cn")
-        # group by type
         reframes = [x for x in retrieved if x.get("type") == "reframe"][:2]
         moves = [x for x in retrieved if x.get("type") == "move"][:3]
         safeguards = [x for x in retrieved if x.get("type") == "safeguard"][:2]
 
-        # slots for filling
         slots = dict(
             decision=decision,
             options=options,
@@ -384,7 +357,6 @@ class DecisionEngine:
                 blocks.append(f"**{x.get('title','')}**\n{x.get('text_filled','')}")
             return "\n\n".join(blocks)
 
-        # ---- precompute (avoid f-string backslash issues) ----
         reasons_bullets = _bulletize("\n".join(reasons))
         next48_bullets = _bulletize("\n".join(next48))
 
@@ -468,12 +440,11 @@ class DecisionEngine:
 
 ## 13. 复盘点（建议）
 - 复盘时间：4–6 周
-- 复盘问题：哪些证据支持继续加码？哪些证据支持止损或换路径？
+- 复盘问题：哪些证据支持继续加码？哪些证据支持止损？哪些信号说明应该换路径？
 """
         return memo
 
     def build_sprint_en(self, payload: Dict[str, Any]) -> str:
-        # Minimal English sprint with slot-filled retrieval items
         decision = (payload.get("decision") or "").strip()
         baseline_12m = (payload.get("baseline_12m") or "").strip()
         best = (payload.get("best") or "").strip()
@@ -483,10 +454,8 @@ class DecisionEngine:
         constraints_str = _safe_str(payload.get("constraints_str") or "time, money, family, emotional bandwidth")
         status_2y = _safe_str(payload.get("status_2y") or baseline_12m)
 
-        # Try to create a "worst focus"
         worst_focus = _first_sentence(worst) if worst else "(empty worst-case)"
 
-        # Retrieve EN items
         query = "\n".join([decision, baseline_12m, best, worst, evidence]).strip()
         retrieved = self._retrieve(query, k=self.cfg.retrieve_k, lang="en")
 
