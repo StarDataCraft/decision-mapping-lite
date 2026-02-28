@@ -4,11 +4,15 @@ from core.engine import DecisionEngine, EngineConfig
 
 st.set_page_config(page_title="Decision Mapping Lite", page_icon="🧭", layout="centered")
 
-@st.cache_resource
+# ✅ 暂时不要 cache_resource：避免 Streamlit Cloud 继续用旧的 engine/library
 def get_engine() -> DecisionEngine:
     return DecisionEngine(EngineConfig())
 
 engine = get_engine()
+
+# ✅ 版本号显示：用来确认你现在跑的是不是新 engine
+st.sidebar.caption(f"Engine: {getattr(engine, 'BUILD_ID', 'OLD_ENGINE')}")
+st.sidebar.caption("If you still see OLD_ENGINE, Streamlit is running old code.")
 
 st.title("🧭 Decision Mapping Lite (RAG-augmented)")
 st.caption("规则推导 + 语义检索增强：更少模板感、更贴你的决策语境。")
