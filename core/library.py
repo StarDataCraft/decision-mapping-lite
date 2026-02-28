@@ -1,10 +1,6 @@
 # core/library.py
 from __future__ import annotations
 
-# Playbook items are now "semi-templates" (slot-filling).
-# The engine will fill placeholders like:
-# {decision} {constraints_str} {priority} {a_worst} {b_worst} {trial_pick} etc.
-
 PLAYBOOK = [
     # -------------------------
     # CN - Reframes
@@ -56,8 +52,8 @@ PLAYBOOK = [
         "text": (
             "不要今天就做“终身决定”。\n"
             "做一个 14 天试探：总投入 <=10 小时，必须产出可展示的结果（作品/报告/项目/访谈纪要）。\n"
-            "继续的条件：你看到的证据门槛（{evidence_to_commit}）。\n"
-            "止损/调整的条件：{evidence_to_stop}。"
+            "你这次试探优先对齐的证据门槛是：{commit_signal_short}\n"
+            "止损/调整信号是：{stop_signal_short}"
         ),
         "tags": ["sprint", "test", "evidence"],
     },
@@ -92,12 +88,13 @@ PLAYBOOK = [
         "id": "cn_safeguard_worst_to_controls",
         "lang": "cn",
         "type": "safeguard",
-        "title": "把最坏结果改写为可控变量（降低 20% 概率）",
+        "title": "把最坏结果拆成变量：每个变量给一个“降低20%概率”的动作",
         "text": (
             "你写的最坏结果之一是：{worst_focus}\n\n"
-            "把它改写成可控问题：\n"
-            "“我能做什么，把这个最坏结果发生的概率降低 20%？”\n"
-            "列 3 个动作，并在 48 小时内做 1 个。"
+            "把它拆成风险变量（越具体越好）：\n"
+            "{risk_variables_bullets}\n\n"
+            "对每个变量，做一个“把概率降低 20%”的最小动作：\n"
+            "{risk_actions_bullets}"
         ),
         "tags": ["risk", "control", "guardrail"],
     },
@@ -114,36 +111,7 @@ PLAYBOOK = [
     },
 
     # -------------------------
-    # EN - Reframes
-    # -------------------------
-    {
-        "id": "en_reframe_optionality",
-        "lang": "en",
-        "type": "reframe",
-        "title": "Reframe: trade controlled uncertainty for optionality",
-        "text": (
-            "On the surface, you’re deciding: {decision}\n\n"
-            "At the deeper level, you’re choosing whether to trade a controlled period of uncertainty\n"
-            "for increased long-term optionality.\n"
-            "Given your constraints ({constraints_str}), a reversible test is often smarter than a one-shot bet."
-        ),
-        "tags": ["optionality", "reframe", "trial"],
-    },
-    {
-        "id": "en_reframe_baseline_cost",
-        "lang": "en",
-        "type": "reframe",
-        "title": "Reframe: doing nothing is also a choice (with cost)",
-        "text": (
-            "Your 2-year baseline says: {status_2y}\n\n"
-            "That means indecision still charges you: windows, confidence, momentum, optionality.\n"
-            "So aim for a test that reduces uncertainty, not a perfect forever-answer."
-        ),
-        "tags": ["baseline", "cost", "reframe"],
-    },
-
-    # -------------------------
-    # EN - Moves
+    # EN - keep minimal (optional)
     # -------------------------
     {
         "id": "en_move_14d_sprint",
@@ -151,39 +119,10 @@ PLAYBOOK = [
         "type": "move",
         "title": "14-day test: reduce uncertainty by ~20%",
         "text": (
-            "Don’t decide forever today.\n"
-            "Run a 14-day test (<10 hours total) that produces visible output.\n"
-            "Continue only if your evidence threshold improves: {evidence_to_commit}\n"
-            "Stop/adjust if stop signals appear: {evidence_to_stop}"
+            "Run a 14-day test (<10 hours) that produces visible output.\n"
+            "Primary continue signal: {commit_signal_short}\n"
+            "Primary stop signal: {stop_signal_short}"
         ),
-        "tags": ["sprint", "test", "evidence"],
-    },
-    {
-        "id": "en_move_proof_of_work",
-        "lang": "en",
-        "type": "move",
-        "title": "Proof-of-work in <5 hours",
-        "text": (
-            "On your trial path ({trial_pick}), build a small proof (demo/write-up/portfolio piece) in <5 hours.\n"
-            "The goal is not perfection — it’s to make the next step obvious."
-        ),
-        "tags": ["proof", "demo", "portfolio"],
-    },
-
-    # -------------------------
-    # EN - Safeguards
-    # -------------------------
-    {
-        "id": "en_safeguard_worst_to_controls",
-        "lang": "en",
-        "type": "safeguard",
-        "title": "Convert your fear into controllable variables",
-        "text": (
-            "One of your worst-case fears is: {worst_focus}\n\n"
-            "Rewrite it into a controllable question:\n"
-            "“What would reduce this risk by 20%?”\n"
-            "List 3 actions and do 1 within 48 hours."
-        ),
-        "tags": ["risk", "control"],
+        "tags": ["sprint", "evidence"],
     },
 ]
