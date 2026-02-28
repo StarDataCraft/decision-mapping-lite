@@ -1,79 +1,68 @@
 # core/embedder.py
 from __future__ import annotations
+
 from dataclasses import dataclass
-from typing import List
+from typing import List, Tuple
 import numpy as np
 
-# Optional: sentence-transformers
 try:
     from sentence_transformers import SentenceTransformer
-except Exception:
+except Exception as e:
     SentenceTransformer = None
-
-# Fallback: TF-IDF
-try:
-    from sklearn.feature_extraction.text import TfidfVectorizer
-except Exception:
-    TfidfVectorizer = None
 
 
 @dataclass
 class EmbeddingConfig:
-    # CPU-friendly open-source model
     model_name: str = "sentence-transformers/all-MiniLM-L6-v2"
+    normalize: bool = True
 
 
 class HybridEmbedder:
     """
-    Preferred: local sentence-transformers embeddings (no key).
-    Fallback: TF-IDF if model can't be loaded (still no key, never crashes the app).
+    Lightweight embedder:
+    - Uses SentenceTransformer to embed documents and query
+    - Returns cosine similarity ranking
+    - Designed for CPU-friendly usage on Streamlit Cloud
     """
+
     def __init__(self, cfg: EmbeddingConfig):
-        self.cfg = cfg
-        self.backend = "sbert"
-        self.model = None
-        self.tfidf = None
-        self._tfidf_docs = None
-
-        if SentenceTransformer is not None:
-            try:
-                self.model = SentenceTransformer(cfg.model_name)
-                return
-            except Exception:
-                # fall through to TF-IDF
-                self.model = None
-
-        self.backend = "tfidf"
-        if TfidfVectorizer is None:
+        if SentenceTransformer is None:
             raise RuntimeError(
-                "Neither sentence-transformers nor sklearn(TF-IDF) is available. "
-                "Add 'sentence-transformers' (and torch) or 'scikit-learn' to requirements.txt."
+                "sentence-transformers not installed. "
+                "Add it to requirements.txt and redeploy."
             )
+        self.cfg = cfg
+        self.model = SentenceTransformer(cfg.model_name)
 
-    def _embed_sbert(self, texts: List[str]) -> np.ndarray:
-        emb = self.model.encode(texts, normalize_embeddings=True, show_progress_bar=False)
-        return np.asarray(emb, dtype=np.float32)
+    def _embed(self, texts: List[str]) -> np.ndarray:
+        vecs = self.model.encode(texts, show_progress_bar=False)
+        vecs = np.asarray(vecs, dtype=np.float32)
+        if self.cfg.normalize:
+            norms = np.linalg.norm(vecs, axis=1, keepdims=True) + 1e-12
+            vecs = vecs / norms
+        return vecs
 
-    def _fit_tfidf(self, docs: List[str]) -> None:
-        # Fit once per doc set
-        self.tfidf = TfidfVectorizer(max_features=5000)
-        self._tfidf_docs = self.tfidf.fit_transform(docs)
+    @staticmethod
+    def _cosine_scores(q: np.ndarray, mat: np.ndarray) -> np.ndarray:
+        # assume normalized -> cosine = dot
+        return mat @ q
 
-    def top_k(self, query: str, docs: List[str], k: int = 5) -> List[int]:
+    def top_k(self, query: str, docs: List[str], k: int = 8) -> List[int]:
+        idxs, _ = self.top_k_with_scores(query, docs, k=k)
+        return idxs
+
+    def top_k_with_scores(self, query: str, docs: List[str], k: int = 8) -> Tuple[List[int], List[float]]:
+        """
+        Returns:
+          - indices of top k docs
+          - similarity scores (cosine)
+        """
         if not docs:
-            return []
-
-        if self.backend == "sbert":
-            q = self._embed_sbert([query])[0]
-            d = self._embed_sbert(docs)
-            sims = (d @ q).astype(np.float32)  # normalized => dot = cosine
-            idx = np.argsort(sims)[::-1][:k]
-            return [int(i) for i in idx.tolist()]
-
-        # TF-IDF fallback
-        if self.tfidf is None or self._tfidf_docs is None:
-            self._fit_tfidf(docs)
-        qv = self.tfidf.transform([query])
-        sims = (self._tfidf_docs @ qv.T).toarray().reshape(-1)
-        idx = np.argsort(sims)[::-1][:k]
-        return [int(i) for i in idx.tolist()]
+            return [], []
+        qv = self._embed([query])[0]
+        dv = self._embed(docs)
+        scores = self._cosine_scores(qv, dv)  # shape [N]
+        order = np.argsort(-scores)[: min(k, len(docs))]
+        idxs = order.tolist()
+        scs = [float(scores[i]) for i in idxs]
+        return idxs, scs
