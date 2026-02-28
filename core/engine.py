@@ -2,91 +2,41 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Dict, List, Any, Tuple
+from typing import Dict, List, Any, Tuple, Optional
 from datetime import datetime
 import re
+
+import numpy as np
+from sklearn.feature_extraction.text import TfidfVectorizer
+from sklearn.preprocessing import normalize
 
 from core.library import PLAYBOOK
 from core.embedder import HybridEmbedder, EmbeddingConfig
 from core.reranker import rerank, RerankConfig
 
 
-# ----------------- small utils -----------------
-def _text_richness_score(text: str) -> int:
-    if not text or not text.strip():
-        return 0
-    t = text.strip()
-    score = 0
-    if len(t) >= 30:
-        score += 1
-    if "\n" in t:
-        score += 1
-    verbs = ["每周", "每天", "固定", "完成", "参与", "整理", "申请", "复盘", "构建", "提交", "发布", "联系", "输出"]
-    if any(v in t for v in verbs):
-        score += 1
-    return score
-
-
-def _worst_severity(worst: str) -> int:
-    if not worst:
-        return 0
-    severe_keywords = ["崩", "失业", "毁", "无法", "严重", "抑郁", "破产", "健康", "关系破裂", "绩效很差", "重病"]
-    return 2 if any(k in worst for k in severe_keywords) else 1
-
-
-def _bulletize(text: str) -> str:
-    if not text:
-        return "（未填写）"
-    t = text.strip()
-    lines = [ln.strip(" \t•-") for ln in t.replace("\r", "").split("\n") if ln.strip()]
-    if len(lines) <= 1:
-        return t
-    return "\n".join([f"- {ln}" for ln in lines])
-
-
-def _split_lines(text: str) -> List[str]:
+# ----------------- basic utils -----------------
+def _lines(text: str) -> List[str]:
     if not text:
         return []
-    raw = text.replace("\r", "").split("\n")
+    raw = text.replace("\r", "\n")
+    raw = raw.replace("•", "-").replace("—", "-")
     out = []
-    for ln in raw:
-        ln = ln.strip().lstrip("•-").strip()
+    for ln in raw.split("\n"):
+        ln = ln.strip()
+        ln = re.sub(r"^\s*[-\*\u2022]\s*", "", ln).strip()
         if ln:
             out.append(ln)
     return out
 
 
-def _concreteness_score(line: str) -> int:
-    if not line:
-        return 0
-    s = 0
-    if re.search(r"\d", line):
-        s += 2
-    if any(k in line for k in ["小时", "h", "周", "每天", "两周", "14 天", "48 小时", "面试", "投递", "真题", "错题", "正确率", "分数", "模拟"]):
-        s += 2
-    if len(line) >= 18:
-        s += 1
-    if any(k in line for k in ["输出", "作品", "项目", "复盘", "内推", "访谈", "计划"]):
-        s += 1
-    return s
-
-
-def _pick_most_concrete_line(text: str) -> str:
-    lines = _split_lines(text)
-    if not lines:
-        return ""
-    scored = sorted(lines, key=lambda x: _concreteness_score(x), reverse=True)
-    return scored[0]
-
-
-def _first_sentence(text: str) -> str:
-    if not text:
-        return ""
-    parts = re.split(r"[。.!?！？]+", text.strip())
-    for p in parts:
-        if p.strip():
-            return p.strip()
-    return text.strip()
+def _bulletize(text: str) -> str:
+    ls = _lines(text)
+    if not ls:
+        return "（未填写）"
+    if len(ls) == 1:
+        return ls[0]
+    return "\n".join([f"- {x}" for x in ls])
 
 
 def _safe_str(x: Any) -> str:
@@ -107,158 +57,221 @@ def _safe_format(template: str, slots: Dict[str, Any]) -> str:
         return template
 
 
-def _bullets(lines: List[str]) -> str:
-    if not lines:
-        return "（无）"
-    return "\n".join([f"- {x}" for x in lines])
-
-
-# ----------------- NEW: signal picker (align to trial path) -----------------
-def _classify_line(line: str) -> str:
-    """
-    very light intent classifier for CN lines:
-      returns one of: employment / grad / civil / other
-    """
-    s = (line or "").strip()
-    if not s:
-        return "other"
-    if any(k in s for k in ["面试", "投递", "简历", "内推", "offer", "岗位", "JD", "作品集", "秋招", "春招"]):
-        return "employment"
-    if any(k in s for k in ["考研", "院校", "分数线", "正确率", "题量", "背诵", "刷题", "复试", "初试"]):
-        return "grad"
-    if any(k in s for k in ["考公", "行测", "申论", "岗位表", "笔试", "面试名单", "体制内", "公考"]):
-        return "civil"
-    return "other"
-
-
-def _pick_signal_by_target(text: str, target: str) -> str:
-    """
-    pick best line matching target; fallback to most concrete line.
-    """
-    lines = _split_lines(text)
-    if not lines:
+def _first_sentence(text: str) -> str:
+    if not text:
         return ""
-    cand = [ln for ln in lines if _classify_line(ln) == target]
-    if cand:
-        cand = sorted(cand, key=lambda x: _concreteness_score(x), reverse=True)
-        return cand[0]
-    return _pick_most_concrete_line(text)
+    parts = re.split(r"[。.!?！？]+", text.strip())
+    for p in parts:
+        if p.strip():
+            return p.strip()
+    return text.strip()
 
 
-def _targets_from_trial_pick(trial_pick: str) -> List[str]:
+# ----------------- "strong-ish" extractor (generic) -----------------
+EXEC_VERBS = [
+    # 中文常见可执行动词
+    "写", "做", "完成", "提交", "投递", "复盘", "整理", "联系", "预约", "访谈", "搭建", "上线", "发布",
+    "练习", "刷题", "背诵", "准备", "打样", "迭代", "优化", "验证", "测试", "记录", "输出", "对齐", "拆解",
+    "评估", "比较", "设定", "执行", "检查", "跑通", "交付",
+    # 英文动词（兼容英文版）
+    "build", "ship", "draft", "write", "test", "iterate", "submit", "apply", "review", "schedule", "interview"
+]
+
+TIME_MARKERS = ["小时", "分钟", "天", "周", "两周", "14", "48", "month", "week", "day", "hour", "minute"]
+
+
+def _concreteness_score(line: str) -> int:
     """
-    infer target(s) from trial_pick wording.
+    更“可试探”的抓手：数字/时间/可执行动词/明确产出
     """
-    s = (trial_pick or "").strip()
-    targets: List[str] = []
-    if any(k in s for k in ["就业", "找工作", "直接就业", "offer"]):
-        targets.append("employment")
-    if any(k in s for k in ["考研", "读研", "研究生"]):
-        targets.append("grad")
-    if any(k in s for k in ["考公", "公考", "体制内"]):
-        targets.append("civil")
-    if not targets:
-        targets = ["other"]
-    return targets
+    if not line:
+        return 0
+    s = 0
+    if re.search(r"\d", line):
+        s += 3
+    if any(t in line for t in TIME_MARKERS):
+        s += 2
+    if any(v in line for v in EXEC_VERBS):
+        s += 2
+    if any(k in line for k in ["输出", "产出", "作品", "demo", "报告", "简历", "PRD", "纪要", "文档", "交付", "commit"]):
+        s += 2
+    if len(line) >= 18:
+        s += 1
+    return s
 
 
-# ----------------- risk variable & action generation (A/B aware) -----------------
-def _extract_risk_variables(worst_text: str, max_n: int = 4) -> List[str]:
-    if not worst_text or not worst_text.strip():
-        return []
-    t = worst_text.strip()
-    t = t.replace("；", "，").replace("。", "，").replace("、", "，")
+def _pick_most_concrete(text: str) -> str:
+    ls = _lines(text)
+    if not ls:
+        return ""
+    return sorted(ls, key=_concreteness_score, reverse=True)[0]
+
+
+def _extract_risk_terms(text: str, limit: int = 5) -> List[str]:
+    """
+    通用风险词表（可扩展）。用于兜底风险变量抽取。
+    """
+    vocab = [
+        "压力", "焦虑", "内耗", "拖延", "失眠", "冲突", "过载",
+        "窗口", "错过", "锁定", "成本", "时间不够", "钱不够", "资源不足",
+        "不匹配", "不适合", "不确定", "失败", "后悔",
+        "成长慢", "停滞", "没有进步", "能力差距", "门槛", "竞争"
+    ]
+    out = [w for w in vocab if w in (text or "")]
+    return out[:limit]
+
+
+def _extract_risk_variables(worst: str, baseline: str, max_n: int = 4) -> List[str]:
+    """
+    通用：优先 worst；不足则 baseline；再不足则风险词兜底
+    """
+    src = (worst or "").strip()
+    if len(src) < 6:
+        src = (baseline or "").strip()
+
+    if not src:
+        terms = _extract_risk_terms((worst or "") + " " + (baseline or ""))
+        return terms[:max_n] if terms else []
+
+    t = src.replace("；", "，").replace("。", "，").replace("、", "，")
     parts = [p.strip() for p in t.split("，") if p.strip()]
-    cleaned: List[str] = []
+
+    cleaned = []
     for p in parts:
         p = re.sub(r"^(同时|而且|并且|以及|另外|导致|从而)", "", p).strip()
         if not p:
             continue
-        # keep short + readable
         if len(p) > 28:
             p = p[:28] + "…"
         if p not in cleaned:
             cleaned.append(p)
-    return cleaned[:max_n]
+
+    if cleaned:
+        return cleaned[:max_n]
+
+    terms = _extract_risk_terms(src)
+    return terms[:max_n]
 
 
-def _risk_actions_for(risks: List[str], mode: str) -> List[str]:
+# ----------------- semantic matcher (generic) -----------------
+class _MiniTfidfMatcher:
     """
-    mode: employment / grad / civil / other
+    超轻量：用于“信号行 -> 最相关路径”的匹配（不需要大模型）
     """
-    out: List[str] = []
+    def __init__(self):
+        self.vec = TfidfVectorizer(
+            max_features=6000,
+            ngram_range=(1, 2),
+            token_pattern=r"(?u)\b\w+\b"
+        )
+
+    def best_match(self, query: str, corpus: List[str]) -> Tuple[int, float]:
+        if not query or not corpus:
+            return -1, 0.0
+        X = self.vec.fit_transform([query] + corpus)
+        X = normalize(X, norm="l2")
+        q = X[0]
+        docs = X[1:]
+        sims = (docs @ q.T).toarray().reshape(-1)
+        idx = int(np.argmax(sims))
+        return idx, float(sims[idx])
+
+
+# ----------------- option model -----------------
+@dataclass
+class Option:
+    name: str
+    best: str = ""
+    worst: str = ""
+    controls: str = ""
+
+    def corpus(self) -> str:
+        # 用于相似度匹配证据行：越全面越稳
+        parts = [self.name, self.best, self.worst, self.controls]
+        return "\n".join([p for p in parts if p])
+
+
+def _risk_actions_generic(
+    risks: List[str],
+    option: Option,
+    constraints_str: str,
+    grip: str
+) -> List[str]:
+    """
+    通用动作生成：不依赖“就业/考研/考公”等具体场景
+    """
+    out = []
+    name = option.name or "该路径"
+    grip = grip or "（你目前还没写出很具体的抓手）"
+
     for r in risks:
-        rr = r
-
-        # shared high-impact actions
-        if any(k in rr for k in ["压力", "焦虑", "内耗", "崩溃", "情绪", "睡眠"]):
-            out.append("先降波动：连续 7 天固定睡眠窗口 + 每天 90 分钟深度块；重大决定只做 14 天试探，不做终身承诺。")
+        r0 = r or ""
+        # 1) 情绪/波动类
+        if any(k in r0 for k in ["压力", "焦虑", "内耗", "失眠", "冲突", "过载"]):
+            out.append(
+                f"[{name}] 先降波动：连续 7 天固定睡眠窗口 + 每天 90 分钟深度块；在约束（{constraints_str}）下，"
+                f"把重大决定降级为 14 天试探。"
+            )
             continue
-        if any(k in rr for k in ["窗口", "错过", "成本", "时间不够", "转向"]):
-            out.append("做对冲：无论主路径选什么，都保留每周 2 小时用于另一条路径的最低维护（投递/真题/信息收集）。")
+
+        # 2) 窗口/错过/成本类
+        if any(k in r0 for k in ["窗口", "错过", "锁定", "成本"]):
+            out.append(
+                f"[{name}] 做对冲：保留每周 2 小时做“另一条备选路径”的最低维护（信息收集/联系关键人/最小产出），"
+                f"避免把风险押成单点。"
+            )
             continue
 
-        if mode == "employment":
-            if any(k in rr for k in ["不匹配", "不合适", "对口", "匹配"]):
-                out.append("做一次 JD 反向拆解：把目标岗位拆成 3 条硬条件 + 3 条软条件，48小时内把简历/作品对齐其中2条。")
-            elif any(k in rr for k in ["成长慢", "成长", "停滞", "没进步"]):
-                out.append("建立“成长仪表盘”：每周产出 1 个可展示成果（报告/小项目/复盘），并找 1 个外部反馈点验证方向。")
-            elif any(k in rr for k in ["忙但不进步", "被消耗", "加班"]):
-                out.append("把工作与成长分层：每周锁死 2 个 90 分钟深度块做作品/面试复盘；其余时间只做保底执行。")
-            else:
-                out.append(f"把“{rr}”改写为可控问题：我能做什么让它发生概率降低 20%？写 3 条动作，48小时内执行 1 条。")
+        # 3) 不匹配/不适合/不确定（定义清楚标准）
+        if any(k in r0 for k in ["不匹配", "不适合", "不确定", "方向不清"]):
+            out.append(
+                f"[{name}] 定义匹配标准：写下 3 条“必须有”+3 条“最好有”，并用你的抓手去对齐其中 2 条：{grip}"
+            )
+            continue
 
-        elif mode == "grad":
-            if any(k in rr for k in ["落榜", "失败", "结果一般"]):
-                out.append("把备考拆成 14 天闭环：题量/正确率/错题复盘三指标；两周后用数据决定是否加码或换策略。")
-            elif any(k in rr for k in ["效率低", "学不动", "坚持不下去"]):
-                out.append("把学习降到“可持续最低配”：每天 60–90 分钟 + 每周一次错题复盘；先守住连续性，再谈强度。")
-            elif any(k in rr for k in ["错过就业", "心理压力", "家庭压力"]):
-                out.append("设置对冲：每周 2 小时做就业最低维护（简历/投递/信息访谈），避免把风险押成单点。")
-            else:
-                out.append(f"把“{rr}”改写为可控问题：我能做什么让它发生概率降低 20%？写 3 条动作，48小时内执行 1 条。")
+        # 4) 能力差距/门槛/竞争（做 proof-of-work）
+        if any(k in r0 for k in ["能力", "差距", "门槛", "竞争"]):
+            out.append(
+                f"[{name}] 做一个 5 小时以内可展示输出（demo/报告/一页方案/复盘），"
+                f"用它换取外部反馈与真实门槛校准。"
+            )
+            continue
 
-        elif mode == "civil":
-            if any(k in rr for k in ["上岸", "落榜", "分数", "竞争"]):
-                out.append("用真题校准：48小时内做一套计时真题+错题归因，确定“提分最快的两个模块”，先攻那两个。")
-            elif any(k in rr for k in ["方法不对", "效率低"]):
-                out.append("建立“错题资产”：每周固定整理错题 + 归因标签（知识点/速度/审题），两周后看提分曲线再调整。")
-            else:
-                out.append(f"把“{rr}”改写为可控问题：我能做什么让它发生概率降低 20%？写 3 条动作，48小时内执行 1 条。")
+        # 5) 时间/钱/资源不足（把约束变成变量）
+        if any(k in r0 for k in ["时间不够", "钱不够", "资源不足"]):
+            out.append(
+                f"[{name}] 把约束变量化：在（{constraints_str}）下，列出 3 个“降低 20% 成本”的动作（删、换、借、外包、缩小范围），48小时先做1个。"
+            )
+            continue
 
-        else:
-            out.append(f"把“{rr}”改写为可控问题：我能做什么让它发生概率降低 20%？写 3 条动作，48小时内执行 1 条。")
+        # default：通用转化
+        out.append(
+            f"[{name}] 把“{r0}”改写成可控问题：我能做什么让它发生概率降低 20%？写 3 条动作，48小时内执行 1 条。"
+        )
 
-    # de-dup + shorten
-    dedup: List[str] = []
+    # 去重 + 截断
+    dedup = []
     for x in out:
         if x not in dedup:
             dedup.append(x)
     return dedup[:4]
 
 
-def _build_safeguard_block(name: str, worst: str, mode: str, max_vars: int, max_actions: int) -> Tuple[str, str]:
-    worst_focus = _first_sentence(worst) if worst.strip() else ""
-    risks = _extract_risk_variables(worst_focus, max_n=max_vars)
-    actions = _risk_actions_for(risks, mode=mode)
-    return _bullets(risks[:max_vars]), _bullets(actions[:max_actions])
-
-
-# ----------------- engine -----------------
+# ----------------- Engine -----------------
 @dataclass
 class EngineConfig:
-    embed_model: str = "sentence-transformers/all-MiniLM-L6-v2"
     retrieve_k: int = 6
-    retrieve_pool: int = 30
+    retrieve_pool: int = 40
 
 
 class DecisionEngine:
-    BUILD_ID = "2026-02-28-rerank-lite-v3-trial-align-ab-safeguard"
+    BUILD_ID = "2026-02-28-generic-slotfill-extractor-tfidf"
 
     def __init__(self, cfg: EngineConfig):
         self.cfg = cfg
-        self.embedder = HybridEmbedder(EmbeddingConfig(model_name=cfg.embed_model))
+        self.embedder = HybridEmbedder(EmbeddingConfig())
         self.rerank_cfg = RerankConfig()
+        self.sig_matcher = _MiniTfidfMatcher()
 
         self._pb_texts = [
             f"{x.get('lang','')} | {x['type']} | {x['title']}\n{x['text']}\nTags: {', '.join(x.get('tags', []))}"
@@ -286,217 +299,163 @@ class DecisionEngine:
         return out[:k]
 
     def _fill_items(self, items: List[Dict[str, Any]], slots: Dict[str, Any]) -> List[Dict[str, Any]]:
-        out: List[Dict[str, Any]] = []
+        out = []
         for x in items:
             y = dict(x)
             y["text_filled"] = _safe_format(y.get("text", ""), slots)
             out.append(y)
         return out
 
-    def _ensure_safeguards(self, lang: str, need: int = 1) -> List[Dict[str, Any]]:
-        pool = [x for x in PLAYBOOK if x.get("lang") == lang and x.get("type") == "safeguard"]
-        if not pool:
-            pool = [x for x in PLAYBOOK if x.get("type") == "safeguard"]
-        return pool[:need] if pool else []
+    def _best_signal_for_option(self, signal_text: str, options: List[Option], target: Option) -> str:
+        """
+        通用：从 signal_text 的多行里，选出“最像 target 这条路径”的 1 行
+        """
+        ls = _lines(signal_text)
+        if not ls:
+            return ""
+
+        corp = [o.corpus() for o in options]
+        # 先筛出：最像 target 的候选行（按相似度排序）
+        scored: List[Tuple[str, float]] = []
+        for ln in ls:
+            idx, sim = self.sig_matcher.best_match(ln, corp)
+            # idx 是“该行最像哪条路径”
+            if idx >= 0 and options[idx].name == target.name:
+                scored.append((ln, sim))
+
+        if scored:
+            scored.sort(key=lambda x: (x[1], _concreteness_score(x[0])), reverse=True)
+            return scored[0][0]
+
+        # 若没有行明显对齐 target，则退化：选最具体的一条（仍然可用）
+        return _pick_most_concrete(signal_text)
 
     def build_memo_cn(self, payload: Dict[str, Any]) -> str:
+        # --- read inputs ---
         decision = (payload.get("decision") or "").strip()
-        options = payload.get("options") or ""
+        options_text = payload.get("options") or ""
         status_6m = payload.get("status_6m") or ""
         status_2y = payload.get("status_2y") or ""
 
-        a_name = payload.get("a_name") or "路径A"
-        a_best = payload.get("a_best") or ""
-        a_worst = payload.get("a_worst") or ""
-        a_controls = payload.get("a_controls") or ""
-
-        b_name = payload.get("b_name") or "路径B"
-        b_best = payload.get("b_best") or ""
-        b_worst = payload.get("b_worst") or ""
-        b_controls = payload.get("b_controls") or ""
-
-        # optional C (if present in form) - only used for signal pick, not full compare in this lite version
-        c_name = payload.get("c_name") or ""
-        c_worst = payload.get("c_worst") or ""
+        a = Option(
+            name=payload.get("a_name") or "路径A",
+            best=payload.get("a_best") or "",
+            worst=payload.get("a_worst") or "",
+            controls=payload.get("a_controls") or ""
+        )
+        b = Option(
+            name=payload.get("b_name") or "路径B",
+            best=payload.get("b_best") or "",
+            worst=payload.get("b_worst") or "",
+            controls=payload.get("b_controls") or ""
+        )
+        opts = [a, b]
 
         priority = payload.get("priority") or "长期选择权（Optionality）"
         constraints = payload.get("constraints") or []
         regret = payload.get("regret") or "没有尝试"
 
-        evidence_to_commit = payload.get("evidence_to_commit") or ""
-        evidence_to_stop = payload.get("evidence_to_stop") or ""
         partial_control = payload.get("partial_control") or ""
         identity_anchor = payload.get("identity_anchor") or ""
 
+        evidence_to_commit = payload.get("evidence_to_commit") or ""
+        evidence_to_stop = payload.get("evidence_to_stop") or ""
+
         constraints_str = "、".join(constraints) if constraints else "（未填写）"
 
-        # ---- rule features ----
-        optionality_pref = priority == "长期选择权（Optionality）"
-        regret_try = regret == "没有尝试"
-        baseline_lockin_risk = bool(status_2y and any(k in status_2y for k in ["窗口", "变窄", "锁定", "定型", "不可逆", "停滞"]))
+        # --- grips: pick most concrete per option ---
+        a_grip = _pick_most_concrete(a.controls)
+        b_grip = _pick_most_concrete(b.controls)
 
-        a_control_rich = _text_richness_score(a_controls)
-        b_control_rich = _text_richness_score(b_controls)
-        a_worst_sev = _worst_severity(a_worst)
-        b_worst_sev = _worst_severity(b_worst)
+        a_grip_score = _concreteness_score(a_grip)
+        b_grip_score = _concreteness_score(b_grip)
 
-        constraint_count = len(constraints) if constraints else 0
-        high_constraint = constraint_count >= 3
-
-        score_min_regret = 0
-        reasons: List[str] = []
-
-        if optionality_pref:
-            score_min_regret += 2
-            reasons.append("你把「长期选择权」放在首位 → 更适合优先选择能增加未来选项的策略。")
-        if regret_try:
-            score_min_regret += 2
-            reasons.append("你的后悔倾向是「没有尝试」→ 更适合先试探、再收敛，而不是直接回避尝试。")
-        if baseline_lockin_risk:
-            score_min_regret += 1
-            reasons.append("Baseline（2年）里出现「窗口/锁定」信号 → 不行动的机会成本偏高。")
-        if max(a_control_rich, b_control_rich) >= 2:
-            score_min_regret += 1
-            reasons.append("至少一条路径的可控抓手足够具体 → 可以用「小步试探」把风险变成计划。")
-        if high_constraint:
-            score_min_regret += 1
-            reasons.append(f"你当前约束较多（{constraint_count}项）→ 更适合分阶段，而不是一次性押注。")
-
-        if score_min_regret >= 4:
-            conclusion = "更偏向「最小后悔路径（Minimum Regret Path）」：用可控的不确定性，去换取长期选择权的上升。"
-            strategy = "采用「小步试探」：保留基本盘，用固定时间块推进新方向；设定 4–6 周复盘点，用证据决定是否加码。"
-            next48 = [
-                "把最坏结果拆成 2–3 个变量，并为每个变量写一个“降低20%概率”的动作（48小时内做1个）。",
-                "选一个 14 天试探：<=10小时，必须产出可展示结果（作品/访谈纪要/项目）。",
-                "把证据门槛写短：只保留“继续信号1条 + 止损信号1条”，其余放在第9节。",
-            ]
+        # --- choose trial_pick (generic) ---
+        # 若差距不大：给“或”，否则选更可试探那条
+        if abs(a_grip_score - b_grip_score) <= 2:
+            trial_pick = f"{a.name} 或 {b.name}"
+            target_option = a  # 用 a 做信号抽取的 primary（不重要，因为“或”会展示双方风险）
         else:
-            conclusion = "更偏向「先降波动、再决策」：先让系统稳定，再谈方向切换。"
-            strategy = "先补齐关键约束（时间块/财务/支持系统），用 2–4 周建立稳定节奏，再做第二轮决策。"
-            next48 = [
-                "把约束分成可控/不可控/部分可控，并挑一个部分可控项先推进。",
-                "为路径 A/B 各写出缺失的 3 个关键事实（门槛/成本/回报/失败模式）。",
-                "设定 2–4 周后复盘点，用新信息再生成一次 memo。",
-            ]
+            target_option = a if a_grip_score > b_grip_score else b
+            trial_pick = target_option.name
 
-        # ---- trial pick ----
-        a_manage = a_control_rich - a_worst_sev
-        b_manage = b_control_rich - b_worst_sev
-        if a_manage == b_manage:
-            trial_pick = f"{a_name} 或 {b_name}"
-        else:
-            trial_pick = a_name if a_manage > b_manage else b_name
+        # --- pick signals (generic semantic match) ---
+        commit_signal_short = self._best_signal_for_option(evidence_to_commit, opts, target_option) or "（未填写继续信号）"
+        stop_signal_short = self._best_signal_for_option(evidence_to_stop, opts, target_option) or "（未填写止损信号）"
 
-        # ---- pick signals aligned to trial_pick ----
-        targets = _targets_from_trial_pick(trial_pick)
-        # prefer first target; if "or", we will keep 1+1 signals but aligned to the dominant/first target
-        primary_target = targets[0] if targets else "other"
-
-        commit_signal_short = _pick_signal_by_target(evidence_to_commit, primary_target) or "（未填写继续信号）"
-        stop_signal_short = _pick_signal_by_target(evidence_to_stop, primary_target) or "（未填写止损信号）"
-
-        # ---- personalization (explain) ----
-        a_best_control = _pick_most_concrete_line(a_controls)
-        b_best_control = _pick_most_concrete_line(b_controls)
-
-        risk_terms = []
-        for w in ["压力", "成长", "不匹配", "窗口", "落榜", "焦虑", "家庭", "自信", "成本", "拖延", "内耗"]:
-            if w in (a_worst + " " + b_worst + " " + c_worst):
-                risk_terms.append(w)
-        risk_terms = risk_terms[:3]
+        # --- risk terms (for explanation only) ---
+        risk_terms = _extract_risk_terms(a.worst + " " + b.worst + " " + status_2y)
         risk_terms_str = "、".join(risk_terms) if risk_terms else "（未提取到明显风险词）"
 
-        # ---- NEW: A/B safeguards (and decide which to show) ----
-        # Heuristic: map path name -> mode
-        def _infer_mode(path_name: str) -> str:
-            s = (path_name or "")
-            if any(k in s for k in ["就业", "找工作", "直接就业", "offer"]):
-                return "employment"
-            if any(k in s for k in ["考研", "读研", "研究生"]):
-                return "grad"
-            if any(k in s for k in ["考公", "公考", "体制内"]):
-                return "civil"
-            return primary_target if primary_target in ["employment", "grad", "civil"] else "other"
-
-        a_mode = _infer_mode(a_name)
-        b_mode = _infer_mode(b_name)
-
-        # If trial_pick contains "或", show both but shorter; else show only the chosen path safeguard
+        # --- safeguards ---
         show_both = "或" in trial_pick
+
         if show_both:
-            a_vars_b, a_actions_b = _build_safeguard_block(a_name, a_worst, a_mode, max_vars=2, max_actions=2)
-            b_vars_b, b_actions_b = _build_safeguard_block(b_name, b_worst, b_mode, max_vars=2, max_actions=2)
-        else:
-            a_vars_b, a_actions_b = _build_safeguard_block(a_name, a_worst, a_mode, max_vars=3, max_actions=3)
-            b_vars_b, b_actions_b = _build_safeguard_block(b_name, b_worst, b_mode, max_vars=3, max_actions=3)
+            a_vars = _extract_risk_variables(a.worst, status_2y, max_n=2)
+            b_vars = _extract_risk_variables(b.worst, status_2y, max_n=2)
+            a_actions = _risk_actions_generic(a_vars, a, constraints_str, a_grip)
+            b_actions = _risk_actions_generic(b_vars, b, constraints_str, b_grip)
 
-        # choose which block to surface in slot-filling
-        if not show_both:
-            chosen_is_a = (trial_pick == a_name)
-            risk_variables_bullets = a_vars_b if chosen_is_a else b_vars_b
-            risk_actions_bullets = a_actions_b if chosen_is_a else b_actions_b
-            safeguard_note = f"（本次优先对齐：{trial_pick}）"
-        else:
-            # combine two mini blocks into one slot (still fits safeguard template)
-            risk_variables_bullets = f"- [{a_name}] 关键风险变量：\n{a_vars_b}\n- [{b_name}] 关键风险变量：\n{b_vars_b}"
-            risk_actions_bullets = f"- [{a_name}] 降低20%概率动作：\n{a_actions_b}\n- [{b_name}] 降低20%概率动作：\n{b_actions_b}"
+            risk_variables_bullets = (
+                f"- [{a.name}] 关键风险变量：\n" + "\n".join([f"- {x}" for x in a_vars]) + "\n"
+                f"- [{b.name}] 关键风险变量：\n" + "\n".join([f"- {x}" for x in b_vars])
+            )
+            risk_actions_bullets = (
+                f"- [{a.name}] 降低20%概率动作：\n" + "\n".join([f"- {x}" for x in a_actions[:2]]) + "\n"
+                f"- [{b.name}] 降低20%概率动作：\n" + "\n".join([f"- {x}" for x in b_actions[:2]])
+            )
             safeguard_note = f"（两条路径都在试探候选里：{trial_pick}）"
+        else:
+            chosen = target_option
+            chosen_grip = a_grip if chosen.name == a.name else b_grip
+            vars_ = _extract_risk_variables(chosen.worst, status_2y, max_n=4)
+            actions_ = _risk_actions_generic(vars_, chosen, constraints_str, chosen_grip)
 
-        # ---- explanation paragraph + evidence loop (NEW) ----
-        evidence_loop = f"""
-你当前约束是：{constraints_str}。在这种约束下，最划算的不是“立刻选对”，而是把决策降级为可逆实验：先用 14 天换证据，再用证据加码/止损。
+            risk_variables_bullets = "\n".join([f"- {x}" for x in vars_]) or "（无）"
+            risk_actions_bullets = "\n".join([f"- {x}" for x in actions_[:3]]) or "（无）"
+            safeguard_note = f"（本次优先对齐：{trial_pick}）"
 
-- 你本轮“继续/加码”的证据门槛（只保留1条）：{commit_signal_short}
-- 你本轮“止损/调整”的提前信号（只保留1条）：{stop_signal_short}
+        # --- explanation paragraph (generic, but “like you”) ---
+        explanation_personal = (
+            "你这里最关键的信息其实不是“路径名字”，而是你写出的 **可控抓手** 与 **风险核心**。\n\n"
+            f"- 你在 {a.name} 里最具体的抓手是：{a_grip if a_grip else '（未写出具体行动）'}\n"
+            f"- 你在 {b.name} 里最具体的抓手是：{b_grip if b_grip else '（未写出具体行动）'}\n"
+            f"- 你反复担心的风险词集中在：{risk_terms_str}\n\n"
+            "所以建议之所以成立，不是因为“某条路更正确”，而是因为：\n"
+            "你已经把不确定性拆成了可行动作（抓手），也识别了风险核心（你在怕什么），下一步只需要用证据门槛把试探闭环起来。\n\n"
+            f"你当前约束是：{constraints_str}。在这种约束下，最划算的不是“立刻选对”，而是把决策降级为可逆实验：先用 14 天换证据，再用证据加码/止损。\n\n"
+            f"- 本轮继续/加码（1条）：{commit_signal_short}\n"
+            f"- 本轮止损/调整（1条）：{stop_signal_short}\n\n"
+            "你要的不是一次性下注，而是让下一步更容易：证据更清晰、风险更可控、后悔更小。"
+        )
 
-你要的不是一次性下注，而是让下一步更容易：证据更清晰、风险更可控、后悔更小。
-""".strip()
+        # --- retrieval query (lightweight embedding) ---
+        query = "\n".join([
+            decision, options_text, status_2y,
+            a.name, a.best, a.worst, a.controls,
+            b.name, b.best, b.worst, b.controls,
+            priority, constraints_str, commit_signal_short, stop_signal_short
+        ]).strip()
 
-        explanation_personal = f"""
-你这里最关键的信息其实不是“路径名字”，而是你写出的 **可控抓手** 与 **风险核心**。
-
-- 你在 {a_name} 里最具体的抓手是：{a_best_control if a_best_control else "（未写出具体行动）"}
-- 你在 {b_name} 里最具体的抓手是：{b_best_control if b_best_control else "（未写出具体行动）"}
-- 你反复担心的风险词集中在：{risk_terms_str}
-
-所以建议之所以成立，不是因为“某条路更正确”，而是因为：
-你已经把不确定性拆成了可行动作（抓手），也识别了风险核心（你在怕什么），下一步只需要用证据门槛把试探闭环起来。
-
-{evidence_loop}
-""".strip()
-
-        # ---- retrieval + rerank ----
-        query = "\n".join([decision, options, status_2y, a_worst, b_worst, priority, constraints_str, commit_signal_short]).strip()
         retrieved = self._retrieve_rerank(query, k=self.cfg.retrieve_k, lang="cn")
-
         reframes = [x for x in retrieved if x.get("type") == "reframe"][:2]
         moves = [x for x in retrieved if x.get("type") == "move"][:3]
-        safeguards = [x for x in retrieved if x.get("type") == "safeguard"][:2]
+        safeguards = [x for x in retrieved if x.get("type") == "safeguard"][:1]
         if not safeguards:
-            safeguards = self._ensure_safeguards(lang="cn", need=1)
+            safeguards = [x for x in PLAYBOOK if x.get("lang") == "cn" and x.get("type") == "safeguard"][:1]
 
         slots = dict(
-            decision=decision,
-            options=options,
-            status_6m=status_6m,
-            status_2y=status_2y,
-            a_name=a_name,
-            b_name=b_name,
-            a_best=a_best,
-            b_best=b_best,
-            a_worst=a_worst,
-            b_worst=b_worst,
             constraints_str=constraints_str,
-            priority=priority,
-            regret=regret,
-            evidence_to_commit=evidence_to_commit,
-            evidence_to_stop=evidence_to_stop,
             trial_pick=trial_pick,
             commit_signal_short=commit_signal_short,
             stop_signal_short=stop_signal_short,
             risk_variables_bullets=risk_variables_bullets,
             risk_actions_bullets=risk_actions_bullets,
             safeguard_note=safeguard_note,
+            a_name=a.name,
+            b_name=b.name,
+            a_worst=a.worst,
+            b_worst=b.worst,
         )
 
         reframes_f = self._fill_items(reframes, slots)
@@ -511,16 +470,6 @@ class DecisionEngine:
                 blocks.append(f"**{x.get('title','')}**\n{x.get('text_filled','')}")
             return "\n\n".join(blocks)
 
-        reasons_bullets = _bulletize("\n".join(reasons))
-        next48_bullets = _bulletize("\n".join(next48))
-
-        control_section = f"""
-## 5. 可控 / 不可控 / 部分可控（把焦虑变成变量）
-- 可控（你能直接改变的）：来自两条路径的「可控变量」清单（见上）。
-- 不可控（你无法决定的）：市场/组织/他人决策/宏观环境等（你的动作是“对冲”，不是内耗）。
-- 部分可控（最值得投入的）：{partial_control.strip() if partial_control.strip() else "（未填写）"}
-""".strip()
-
         memo = f"""# 决策备忘录（Decision Memo）
 生成时间：{datetime.now().strftime('%Y-%m-%d %H:%M')}
 
@@ -528,45 +477,42 @@ class DecisionEngine:
 {decision if decision else "（未填写）"}
 
 ## 2. 备选路径
-{_bulletize(options)}
+{_bulletize(options_text)}
 
 ## 3. 如果不改变（Baseline）
 - 6个月：{status_6m.strip() if status_6m.strip() else "（未填写）"}
 - 2年：{status_2y.strip() if status_2y.strip() else "（未填写）"}
 
 ## 4. 路径对比（最好/最坏/可控）
-### {a_name}
-- 最好：{a_best.strip() if a_best.strip() else "（未填写）"}
-- 最坏：{a_worst.strip() if a_worst.strip() else "（未填写）"}
+### {a.name}
+- 最好：{a.best.strip() if a.best.strip() else "（未填写）"}
+- 最坏：{a.worst.strip() if a.worst.strip() else "（未填写）"}
 - 可控变量：
-{_bulletize(a_controls)}
+{_bulletize(a.controls)}
 
-### {b_name}
-- 最好：{b_best.strip() if b_best.strip() else "（未填写）"}
-- 最坏：{b_worst.strip() if b_worst.strip() else "（未填写）"}
+### {b.name}
+- 最好：{b.best.strip() if b.best.strip() else "（未填写）"}
+- 最坏：{b.worst.strip() if b.worst.strip() else "（未填写）"}
 - 可控变量：
-{_bulletize(b_controls)}
+{_bulletize(b.controls)}
 
-{control_section}
+## 5. 可控 / 不可控 / 部分可控（把焦虑变成变量）
+- 可控（你能直接改变的）：来自两条路径的「可控变量」清单（见上）。
+- 不可控（你无法决定的）：市场/组织/他人决策/宏观环境等（你的动作是“对冲”，不是内耗）。
+- 部分可控（最值得投入的）：{partial_control.strip() if partial_control.strip() else "（未填写）"}
 
 ## 6. 目标函数与约束（你在优化什么）
 你最重视的是「{priority}」。你当前的约束是：{", ".join(constraints) if constraints else "（未选择）"}。你的后悔倾向是「{regret}」。
 
 ## 7. 推导链（Why）
-### 7.1 关键指标
-- 最小后悔倾向得分：{score_min_regret}（阈值：4+ 更倾向「试探型最小后悔路径」）
-- 可控性（richness，0~3）：{a_name}={a_control_rich}，{b_name}={b_control_rich}
-- 最坏结果严重度（0~2）：{a_name}={a_worst_sev}，{b_name}={b_worst_sev}
+### 7.1 本轮试探候选
 - 试探路径候选：{trial_pick}
 
-### 7.2 触发的依据
-{reasons_bullets}
-
-### 7.3 基于你输入的“解释段”（更像你自己的版本）
+### 7.2 基于你输入的“解释段”（更像你自己的版本）
 {explanation_personal}
 
-## 8. 检索增强（两阶段：embedding→轻量rerank）
-> 这部分：先用 embedding 召回一批候选，再用“零模型轻量 rerank”重排（字符ngram+类型偏置），提高覆盖与稳定性。
+## 8. 检索增强（两阶段：轻量embedding→轻量rerank）
+> 这部分：先用 TF-IDF 混合 embedding 召回候选，再用 ngram/重叠率/类型偏置做轻量 rerank，提高贴合度与稳定性。
 
 ### 8.1 Reframes（问题重构）
 {fmt_cards(reframes_f)}
@@ -582,12 +528,13 @@ class DecisionEngine:
 - 止损/换路径的信号：{evidence_to_stop.strip() if evidence_to_stop.strip() else "（未填写）"}
 
 ## 10. 建议（可执行版本）
-结论：{conclusion}
-
-策略：{strategy}
+结论：更偏向「最小后悔路径（Minimum Regret Path）」：用可控的不确定性，去换取长期选择权的上升。
+策略：采用「小步试探」：保留基本盘，用固定时间块推进新方向；设定 4–6 周复盘点，用证据决定是否加码。
 
 ## 11. 下一步（48小时内）
-{next48_bullets}
+- 把最坏结果拆成 2–3 个变量，并为每个变量写一个“降低20%概率”的动作（48小时内做1个）。
+- 选一个 14 天试探：<=10小时，必须产出可展示结果（作品/访谈纪要/项目）。
+- 把证据门槛写短：只保留“继续信号1条 + 止损信号1条”，其余放在第9节。
 
 ## 12. 身份轨迹锚（你正在成为谁）
 {identity_anchor.strip() if identity_anchor.strip() else "（未填写）"}
