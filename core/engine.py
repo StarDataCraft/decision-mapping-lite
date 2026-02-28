@@ -106,6 +106,63 @@ def _safe_format(template: str, slots: Dict[str, Any]) -> str:
         return template
 
 
+# -------- NEW: risk variable extraction + actions (rule-based, lightweight) --------
+def _extract_risk_variables(worst_text: str) -> List[str]:
+    """
+    Split worst outcome sentence into 2~4 "risk variables".
+    CN heuristic: split by comma/semicolon/、 and keep compact phrases.
+    """
+    if not worst_text or not worst_text.strip():
+        return []
+    t = worst_text.strip()
+    t = t.replace("；", "，").replace("。", "，").replace("、", "，")
+    parts = [p.strip() for p in t.split("，") if p.strip()]
+    cleaned: List[str] = []
+    for p in parts:
+        p = re.sub(r"^(同时|而且|并且|以及|另外|导致|从而)", "", p).strip()
+        if not p:
+            continue
+        if len(p) > 28:
+            p = p[:28] + "…"
+        if p not in cleaned:
+            cleaned.append(p)
+    return cleaned[:4]
+
+
+def _risk_actions_for(risks: List[str]) -> List[str]:
+    """
+    Map each risk variable to a minimal action that plausibly reduces probability by ~20%.
+    Still rule-based, but reads like reasoning rather than template.
+    """
+    out: List[str] = []
+    for r in risks:
+        if any(k in r for k in ["不匹配", "不合适", "对口", "匹配"]):
+            out.append("做一次 JD 反向拆解：把目标岗位拆成 3 条硬条件 + 3 条软条件，48小时内把简历/作品对齐其中2条。")
+        elif any(k in r for k in ["压力", "焦虑", "内耗", "崩溃", "情绪"]):
+            out.append("先降波动：连续 7 天固定睡眠窗口 + 每天 90 分钟深度块；决策只做 14 天试探，不做终身承诺。")
+        elif any(k in r for k in ["成长慢", "成长", "停滞", "没进步"]):
+            out.append("建立“成长仪表盘”：每周产出 1 个可展示成果（报告/项目/复盘），并找 1 个外部反馈点验证方向。")
+        elif any(k in r for k in ["成本", "转向", "窗口", "错过"]):
+            out.append("做对冲：无论主路径选什么，都保留每周 2 小时用于另一条路径的最低维护（投递/真题/信息收集）。")
+        elif any(k in r for k in ["落榜", "失败", "结果一般"]):
+            out.append("把备考拆成 14 天闭环：题量/正确率/错题复盘三指标；两周后用数据决定是否加码或换策略。")
+        else:
+            out.append(f"把“{r}”改写为可控问题：我能做什么让它发生概率降低 20%？写 3 条动作，48小时内执行 1 条。")
+
+    # unique, keep short
+    dedup: List[str] = []
+    for x in out:
+        if x not in dedup:
+            dedup.append(x)
+    return dedup[:4]
+
+
+def _bullets(lines: List[str]) -> str:
+    if not lines:
+        return "（无）"
+    return "\n".join([f"- {x}" for x in lines])
+
+
 @dataclass
 class EngineConfig:
     embed_model: str = "sentence-transformers/all-MiniLM-L6-v2"
@@ -114,7 +171,7 @@ class EngineConfig:
 
 
 class DecisionEngine:
-    BUILD_ID = "2026-02-28-rerank-lite-v1"
+    BUILD_ID = "2026-02-28-rerank-lite-v2-riskfill"
 
     def __init__(self, cfg: EngineConfig):
         self.cfg = cfg
@@ -127,22 +184,13 @@ class DecisionEngine:
         ]
 
     def _retrieve_rerank(self, query: str, k: int, lang: str) -> List[Dict[str, Any]]:
-        """
-        Two-stage retrieval:
-          1) embedding topN (retrieve_pool)
-          2) lightweight rerank (no extra model) -> topK
-        """
         pool = min(max(self.cfg.retrieve_pool, k * 3), len(PLAYBOOK))
         idxs, scores = self.embedder.top_k_with_scores(query, self._pb_texts, k=pool)
         candidates = [PLAYBOOK[i] for i in idxs]
         cand_scores = scores
 
-        # language prefer
-        # keep all for rerank but give lang-matched a small bonus via text itself; simplest:
-        # we do post-filter: keep enough lang candidates
         reranked = rerank(query, candidates, cand_scores, self.rerank_cfg)
 
-        # take lang first if possible
         out: List[Dict[str, Any]] = []
         for item, _ in reranked:
             if item.get("lang") == lang:
@@ -150,7 +198,6 @@ class DecisionEngine:
             if len(out) >= k:
                 break
 
-        # if not enough, fill with any language
         if len(out) < k:
             for item, _ in reranked:
                 if item not in out:
@@ -168,29 +215,11 @@ class DecisionEngine:
             out.append(y)
         return out
 
-    def _ensure_safeguards(self, items: List[Dict[str, Any]], lang: str, need: int = 1) -> List[Dict[str, Any]]:
-        """
-        If safeguards are empty after retrieval, hard-pick from PLAYBOOK by type.
-        Ensures Safeguards section never becomes (无).
-        """
-        safeguards = [x for x in items if x.get("type") == "safeguard"]
-        if len(safeguards) >= need:
-            return safeguards[:need]
-
-        # hard fallback
+    def _ensure_safeguards(self, lang: str, need: int = 1) -> List[Dict[str, Any]]:
         pool = [x for x in PLAYBOOK if x.get("lang") == lang and x.get("type") == "safeguard"]
-        # if still none, fallback any lang
         if not pool:
             pool = [x for x in PLAYBOOK if x.get("type") == "safeguard"]
-
-        # take first few unique
-        for x in pool:
-            if x not in safeguards:
-                safeguards.append(x)
-            if len(safeguards) >= need:
-                break
-
-        return safeguards[:need]
+        return pool[:need] if pool else []
 
     def build_memo_cn(self, payload: Dict[str, Any]) -> str:
         decision = (payload.get("decision") or "").strip()
@@ -305,6 +334,12 @@ class DecisionEngine:
         worst_focus = _first_sentence(a_worst) if a_worst.strip() else _first_sentence(b_worst)
         worst_focus = worst_focus or "（未填写最坏结果）"
 
+        # -------- NEW: fill safeguard slots --------
+        risk_vars = _extract_risk_variables(worst_focus)
+        risk_actions = _risk_actions_for(risk_vars)
+        risk_variables_bullets = _bullets(risk_vars)
+        risk_actions_bullets = _bullets(risk_actions)
+
         # ---- retrieval + rerank ----
         query = "\n".join([decision, options, status_2y, a_worst, b_worst, priority, constraints_str, commit_signal_short]).strip()
         retrieved = self._retrieve_rerank(query, k=self.cfg.retrieve_k, lang="cn")
@@ -313,7 +348,7 @@ class DecisionEngine:
         moves = [x for x in retrieved if x.get("type") == "move"][:3]
         safeguards = [x for x in retrieved if x.get("type") == "safeguard"][:2]
         if not safeguards:
-            safeguards = self._ensure_safeguards(retrieved, lang="cn", need=1)
+            safeguards = self._ensure_safeguards(lang="cn", need=1)
 
         slots = dict(
             decision=decision,
@@ -335,6 +370,9 @@ class DecisionEngine:
             worst_focus=worst_focus,
             commit_signal_short=commit_signal_short,
             stop_signal_short=stop_signal_short,
+            # NEW slots used by safeguard template
+            risk_variables_bullets=risk_variables_bullets,
+            risk_actions_bullets=risk_actions_bullets,
         )
 
         reframes_f = self._fill_items(reframes, slots)
