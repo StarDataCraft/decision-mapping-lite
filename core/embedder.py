@@ -1,41 +1,79 @@
 # core/embedder.py
 from __future__ import annotations
 from dataclasses import dataclass
-from typing import List, Optional
+from typing import List
 import numpy as np
 
+# Optional: sentence-transformers
 try:
     from sentence_transformers import SentenceTransformer
-except Exception:  # pragma: no cover
+except Exception:
     SentenceTransformer = None
 
-
-def _cosine_sim(a: np.ndarray, b: np.ndarray) -> float:
-    denom = (np.linalg.norm(a) * np.linalg.norm(b)) + 1e-12
-    return float(np.dot(a, b) / denom)
+# Fallback: TF-IDF
+try:
+    from sklearn.feature_extraction.text import TfidfVectorizer
+except Exception:
+    TfidfVectorizer = None
 
 
 @dataclass
 class EmbeddingConfig:
-    # 轻量、CPU 友好：适合 Streamlit Cloud
-    # 你也可以换成更强但更重的，例如 "BAAI/bge-m3"（通常不建议云端CPU）
+    # CPU-friendly open-source model
     model_name: str = "sentence-transformers/all-MiniLM-L6-v2"
 
 
-class LocalEmbedder:
+class HybridEmbedder:
+    """
+    Preferred: local sentence-transformers embeddings (no key).
+    Fallback: TF-IDF if model can't be loaded (still no key, never crashes the app).
+    """
     def __init__(self, cfg: EmbeddingConfig):
-        if SentenceTransformer is None:
-            raise RuntimeError("sentence-transformers is not available.")
         self.cfg = cfg
-        self.model = SentenceTransformer(cfg.model_name)
+        self.backend = "sbert"
+        self.model = None
+        self.tfidf = None
+        self._tfidf_docs = None
 
-    def embed(self, texts: List[str]) -> np.ndarray:
+        if SentenceTransformer is not None:
+            try:
+                self.model = SentenceTransformer(cfg.model_name)
+                return
+            except Exception:
+                # fall through to TF-IDF
+                self.model = None
+
+        self.backend = "tfidf"
+        if TfidfVectorizer is None:
+            raise RuntimeError(
+                "Neither sentence-transformers nor sklearn(TF-IDF) is available. "
+                "Add 'sentence-transformers' (and torch) or 'scikit-learn' to requirements.txt."
+            )
+
+    def _embed_sbert(self, texts: List[str]) -> np.ndarray:
         emb = self.model.encode(texts, normalize_embeddings=True, show_progress_bar=False)
         return np.asarray(emb, dtype=np.float32)
 
+    def _fit_tfidf(self, docs: List[str]) -> None:
+        # Fit once per doc set
+        self.tfidf = TfidfVectorizer(max_features=5000)
+        self._tfidf_docs = self.tfidf.fit_transform(docs)
+
     def top_k(self, query: str, docs: List[str], k: int = 5) -> List[int]:
-        q = self.embed([query])[0]
-        d = self.embed(docs)
-        sims = [float(np.dot(q, d[i])) for i in range(len(docs))]  # normalized => dot = cosine
+        if not docs:
+            return []
+
+        if self.backend == "sbert":
+            q = self._embed_sbert([query])[0]
+            d = self._embed_sbert(docs)
+            sims = (d @ q).astype(np.float32)  # normalized => dot = cosine
+            idx = np.argsort(sims)[::-1][:k]
+            return [int(i) for i in idx.tolist()]
+
+        # TF-IDF fallback
+        if self.tfidf is None or self._tfidf_docs is None:
+            self._fit_tfidf(docs)
+        qv = self.tfidf.transform([query])
+        sims = (self._tfidf_docs @ qv.T).toarray().reshape(-1)
         idx = np.argsort(sims)[::-1][:k]
         return [int(i) for i in idx.tolist()]
